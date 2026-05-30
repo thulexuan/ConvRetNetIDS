@@ -271,7 +271,7 @@ class TransformerClassifier(nn.Module):
         self.fc = nn.Linear(embedding_dim, num_classes)
         self.apply(self.init_weight)
 
-    def forward(self, x): # when call Transformer Classifier, put x is a sequence of tokens
+    def get_features(self, x): # when call Transformer Classifier, put x is a sequence of tokens
         # print("Investigating the input x of Transformer Classifier: ", x.shape) # expectedshape is (batch_size, sequence_length, embedding_dim)
         b = x.shape[0]
 
@@ -287,7 +287,7 @@ class TransformerClassifier(nn.Module):
 
         
         # with RetNet
-        x, _ = self.retnet_blocks(prev_output_tokens=x, token_embeddings=x) # if using entire RetNet, need to pass both prev_output_tokens and token_embeddings. If using RetNet block, only need to pass token_embeddings
+        x, _ = self.retnet_blocks(prev_output_tokens=x, token_embeddings=x) # (batch_size, sequence_length, embedding_dim)
                 
         if self.seq_pool:
             attn_weights = rearrange(self.attention_pool(x), 'b n 1 -> b n')
@@ -295,7 +295,10 @@ class TransformerClassifier(nn.Module):
         else:
             x = x[:, -1] # get the last token, shape is (batch_size, embedding_dim)
 
-        return self.fc(x) # shape is (batch_size, num_classes)
+        return x # shape is (128, 256)
+
+    def forward(self, x): # (128, 256)
+        return self.fc(self.get_features(x)) # (128, 10)
 
     @staticmethod
     def init_weight(m):
@@ -325,6 +328,8 @@ class CCTRetNet(nn.Module):
         dropout_rate=0.,
         attention_dropout=0.1,
         stochastic_depth_rate=0.1,
+        projection_head='mlp',
+        projection_dim=128,
         *args, **kwargs
     ):
         super().__init__()
@@ -353,9 +358,29 @@ class CCTRetNet(nn.Module):
             attention_dropout=attention_dropout,
             stochastic_depth_rate=stochastic_depth_rate,
             *args, **kwargs)
+        
+        # add projection head 
+        if projection_head == 'linear':
+            self.head = nn.Linear(embedding_dim, projection_dim)
+        elif projection_head == 'mlp':
+            self.head = nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(embedding_dim, projection_dim)
+            )
+        else:
+            raise NotImplementedError(
+                'head not supported: {}'.format(projection_head))
+    
+    def encode(self, x): # (128, 3, 64, 64)
+        x = self.tokenizer(x)
+        return self.classifier.get_features(x) # (128, 256)
+    
+    def projection(self, features): # (128, 256)
+        return self.head(features) # (128, 128)
 
-    def forward(self, x):
+    def forward(self, x): # (128, 3, 64, 64)
 
         x = self.tokenizer(x)
 
-        return self.classifier(x) # shape is (batch_size, num_classes)
+        return self.classifier(x) # shape is (128, 10)
