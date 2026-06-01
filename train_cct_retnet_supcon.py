@@ -26,6 +26,7 @@ from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_sc
 from torch.utils.tensorboard import SummaryWriter
 
 from networks.cct_retnet import CCTRetNet
+from ndcl.negative_dominant_embedding_loss import NegativeDominantEmbeddingLoss
 
 class EarlyStopping:
     def __init__(self, patience=20, delta=0.0, enabled=True):
@@ -148,7 +149,7 @@ def parse_option():
     opt.device = torch.device('cuda:0')
     # set the path according to the environment
     if opt.data_folder is None:
-        opt.data_folder = './data/size_64_10/TFRecord_w64_s32/2/'
+        opt.data_folder = './data/size_64_10/TFRecord_w64_s32/3/'
     opt.model_path = './save/{}_models/{}'.format(opt.dataset, opt.method)
 
     iterations = opt.lr_decay_epochs.split(',')
@@ -203,7 +204,7 @@ def set_model(opt):
     
     model = CCTRetNet(
         img_size = 64,
-        embedding_dim = 256, # the number of filters in the convolutional layers = the dimension of tokens before put into transformer encoder
+        embedding_dim = 128, # the number of filters in the convolutional layers = the dimension of tokens before put into transformer encoder
         n_conv_layers = 2, # number of convolutional layers
         kernel_size = 3,
         stride = 1,
@@ -211,16 +212,18 @@ def set_model(opt):
         pooling_kernel_size = 2,
         pooling_stride = 2,
         pooling_padding = 0,
-        num_layers = 4, # the number of transformer encoder layers
-        num_heads = 4, # the number of attention heads in each transformer encoder layer
-        mlp_ratio = 2.5, # dim feedforward layer = embedding_dim * mlp_ratio, current case = 256 * 2.5 = 640
+        num_layers = 2, # the number of transformer encoder layers
+        num_heads = 2, # the number of attention heads in each transformer encoder layer
+        mlp_ratio = 2.5, # dim feedforward layer = embedding_dim * mlp_ratio, current case = 128 * 2.5 = 320
         num_classes = 10,
         positional_embedding = 'learnable', # ['sine', 'learnable', 'none']
     )
 
-    criterion_model = SupConLoss(temperature=0.07, contrast_mode='one')
+    criterion_model = NegativeDominantEmbeddingLoss(temperature=0.07, 
+                                                    # contrast_mode='one'
+                                                    )
 
-    classifier = LinearClassifier(num_classes=opt.n_classes, feat_dim=256)
+    classifier = LinearClassifier(num_classes=opt.n_classes, feat_dim=128)
     criterion_classifier = torch.nn.CrossEntropyLoss()
 
     model = model.to(opt.device)
@@ -294,8 +297,8 @@ def train(train_loader, model, criterion, optimizer, epoch, opt, step):
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
         # here, model is CCTRetNet
-        output_features = model.encode(images) # (128, 1, 256)
-        outputs = model.projection(output_features) # (128, 1, 128))
+        output_features = model.encode(images) # (128, 1, 128)
+        outputs = model.projection(output_features) # (128, 1, 128)
 
         outputs = outputs.unsqueeze(1) # tạo thêm 1 chiều cho n_views, ở đây n_views = 1, nên shape sẽ là (bsz, 1, projection_dim)
         loss = criterion(outputs, labels)
@@ -376,7 +379,7 @@ def validate(val_loader, model, classifier, criterion, opt):
         for images, labels in tqdm(val_loader): 
             images = images.to(opt.device, non_blocking=True)
             labels = labels.to(opt.device, non_blocking=True)
-            outputs = classifier(model(images)) # shape is (batch_size, num_classes) after go through classifier
+            outputs = classifier(model.encode(images)) # shape is (batch_size, num_classes) after go through classifier
             bsz = labels.size(0)
             loss = criterion(outputs, labels)
             losses.update(loss.item(), bsz)
@@ -494,6 +497,28 @@ def main():
             log_writer.write(f'Recall: {recall:.4f}\n')
             log_writer.write(f'Confusion Matrix:\n{pp.pformat(conf_matrix)}\n')
 
+            # early stopping
+            improved = early_stopping(
+                loss,
+                val_f1,
+                model,
+                optimizer,
+                opt,
+                epoch,
+                opt.save_folder
+            )
+
+            if improved:
+                log_writer.write(
+                    f'Best checkpoint updated at epoch {early_stopping.best_epoch} '
+                    f'(val F1 {early_stopping.best_f1:.4f})\n'
+                )
+            else: 
+                log_writer.write(
+                    f'Early stop counter: {early_stopping.counter}/{opt.early_stop_patience} '
+                    f'(best val F1 {early_stopping.best_f1:.4f} at epoch {early_stopping.best_epoch})\n'    
+                )
+
             # Print results
             print(f'Validation loss: {loss:.4f}')
             print(f'Accuracy: {accuracy:.4f}')
@@ -521,6 +546,19 @@ def main():
         if epoch % opt.save_freq == 0:
             model_save_file = os.path.join(opt.save_folder, f'ckpt_epoch_{epoch}.pth')
             save_model(model, optimizer, opt, epoch, model_save_file)
+
+        if early_stopping.early_stop:
+            print(
+                f'Early stopping at epoch {epoch}. '
+                f'Best validation F1 {early_stopping.best_f1:.4f} at epoch {early_stopping.best_epoch}. '
+                f'Min validation loss {early_stopping.val_loss_min:.4f} at epoch {early_stopping.val_loss_min_epoch}.'
+            )
+            log_writer.write(
+                f'Early stopping at epoch {epoch}. '
+                f'Best validation F1 {early_stopping.best_f1:.4f} at epoch {early_stopping.best_epoch}. '
+                f'Min validation loss {early_stopping.val_loss_min:.4f} at epoch {early_stopping.val_loss_min_epoch}.\n'
+            )
+            break
 
     # save last checkpoint after training is done
     model_save_file = os.path.join(opt.save_folder, f'last.pth')

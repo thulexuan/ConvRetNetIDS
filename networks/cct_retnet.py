@@ -316,7 +316,7 @@ class CCTRetNet(nn.Module):
     def __init__(
         self,
         img_size=64,
-        embedding_dim=256, # dimension of each token after tokenization = the number of filters in convolutional layers
+        embedding_dim=128, # dimension of each token after tokenization = the number of filters in convolutional layers
         n_input_channels=3,
         n_conv_layers=2,
         kernel_size=3,
@@ -329,7 +329,7 @@ class CCTRetNet(nn.Module):
         attention_dropout=0.1,
         stochastic_depth_rate=0.1,
         projection_head='mlp',
-        projection_dim=128,
+        projection_dim=64,
         *args, **kwargs
     ):
         super().__init__()
@@ -374,10 +374,65 @@ class CCTRetNet(nn.Module):
     
     def encode(self, x): # (128, 3, 64, 64)
         x = self.tokenizer(x)
-        return self.classifier.get_features(x) # (128, 256)
+        return self.classifier.get_features(x) # (128, 128)
     
-    def projection(self, features): # (128, 256)
-        return self.head(features) # (128, 128)
+    def projection(self, features): # (128, 128)
+        return self.head(features) # (128, 64)
+
+    def forward(self, x): # (128, 3, 64, 64)
+
+        x = self.tokenizer(x)
+
+        return self.classifier(x) # shape is (128, 10)
+    
+class CCTRetNetNoProjectionHead(nn.Module):
+    def __init__(
+        self,
+        img_size=64,
+        embedding_dim=256, # dimension of each token after tokenization = the number of filters in convolutional layers
+        n_input_channels=3,
+        n_conv_layers=2,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        pooling_kernel_size=2,
+        pooling_stride=2,
+        pooling_padding=0,
+        dropout_rate=0.,
+        attention_dropout=0.1,
+        stochastic_depth_rate=0.1,
+        *args, **kwargs
+    ):
+        super().__init__()
+        img_height, img_width = pair(img_size)
+
+        self.tokenizer = Tokenizer(n_input_channels=n_input_channels,  # number of channels in the input image. after implementing convolution, image from [3, 64, 64] -> [embedding_dim, 64, 64]
+                                   n_output_channels=embedding_dim, # the number of filters
+                                   kernel_size=kernel_size,  # kernel size for convolutional layers
+                                   stride=stride,
+                                   padding=padding,
+                                   pooling_kernel_size=pooling_kernel_size,
+                                   pooling_stride=pooling_stride,
+                                   pooling_padding=pooling_padding,
+                                   max_pool=True,
+                                   activation=nn.ReLU,
+                                   n_conv_layers=n_conv_layers, # number of comvolutional layers
+                                   conv_bias=False)
+
+        self.classifier = TransformerClassifier(
+            sequence_length=self.tokenizer.sequence_length(n_channels=n_input_channels, # number of channels in the input image (3)
+                                                           height=img_height,
+                                                           width=img_width),
+            embedding_dim=embedding_dim, # 256
+            seq_pool=True,
+            dropout_rate=dropout_rate,
+            attention_dropout=attention_dropout,
+            stochastic_depth_rate=stochastic_depth_rate,
+            *args, **kwargs)
+    
+    def encode(self, x): # (128, 3, 64, 64)
+        x = self.tokenizer(x)
+        return self.classifier.get_features(x) # (128, 256)
 
     def forward(self, x): # (128, 3, 64, 64)
 

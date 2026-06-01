@@ -248,11 +248,11 @@ class EncoderDecoderConfig(object):
 
 class RetNetConfig(object):
     def __init__(self, **kwargs):
-        self.decoder_embed_dim = kwargs.pop("decoder_embed_dim", 256) # token embedding dimension
-        self.decoder_value_embed_dim = kwargs.pop("decoder_value_embed_dim", 256) # 128 * 2
-        self.decoder_retention_heads = kwargs.pop("decoder_retention_heads", 4) # the number of retention heads in each layer, d_model is divisible by d_each_head 
+        self.decoder_embed_dim = kwargs.pop("decoder_embed_dim", 128) # token embedding dimension
+        self.decoder_value_embed_dim = kwargs.pop("decoder_value_embed_dim", 128) # 128 * 2
+        self.decoder_retention_heads = kwargs.pop("decoder_retention_heads", 2) # the number of retention heads in each layer, d_model is divisible by d_each_head 
         self.decoder_ffn_embed_dim = kwargs.pop("decoder_ffn_embed_dim", 256)
-        self.decoder_layers = kwargs.pop("decoder_layers", 4) # the number of layers
+        self.decoder_layers = kwargs.pop("decoder_layers", 2) # the number of layers
         self.decoder_normalize_before = kwargs.pop("decoder_normalize_before", True)
         self.activation_fn = kwargs.pop("activation_fn", "gelu")
         self.dropout = kwargs.pop("dropout", 0.0)
