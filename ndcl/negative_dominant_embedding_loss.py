@@ -177,7 +177,7 @@ class NegativeDominantEmbeddingLoss(nn.Module):
             stats:
                 Dictionary with useful diagnostic values.
         """
-        print("NDCL forward: embeddings shape:", embeddings.shape, "labels shape:", labels.shape)
+        # print("NDCL forward: embeddings shape:", embeddings.shape, "labels shape:", labels.shape)
         if embeddings.ndim != 2:
             raise ValueError("embeddings must have shape [B, D].")
         if labels.ndim != 1:

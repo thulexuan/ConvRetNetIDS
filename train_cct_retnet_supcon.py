@@ -19,6 +19,7 @@ from datetime import datetime
 from networks.resnet_big import LinearClassifier
 from supcon.losses import SupConLoss
 from supcon.util import accuracy
+from tsc_oneview_implementation.tsc_oneview_loss import TSCOneViewLoss
 from util import AverageMeter
 from util import warmup_learning_rate
 from util import save_model
@@ -142,7 +143,7 @@ def parse_option():
                         help='warm-up for large batch training')
     parser.add_argument('--trial', type=str, default='0',
                         help='id for recording multiple runs')
-    parser.add_argument('--early_stop_patience', type=int, default=10,
+    parser.add_argument('--early_stop_patience', type=int, default=20,
                         help='patience for early stopping')
     opt = parser.parse_args()
 
@@ -219,9 +220,7 @@ def set_model(opt):
         positional_embedding = 'learnable', # ['sine', 'learnable', 'none']
     )
 
-    criterion_model = NegativeDominantEmbeddingLoss(temperature=0.07, 
-                                                    # contrast_mode='one'
-                                                    )
+    criterion_model = SupConLoss()
 
     classifier = LinearClassifier(num_classes=opt.n_classes, feat_dim=128)
     criterion_classifier = torch.nn.CrossEntropyLoss()
@@ -297,13 +296,12 @@ def train(train_loader, model, criterion, optimizer, epoch, opt, step):
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
         # here, model is CCTRetNet
-        output_features = model.encode(images) # (128, 1, 128)
-        outputs = model.projection(output_features) # (128, 1, 128)
+        output_features = model.encode(images) # (128, 128)
+        outputs = model.projection(output_features) # (128, 64)
 
         outputs = outputs.unsqueeze(1) # tạo thêm 1 chiều cho n_views, ở đây n_views = 1, nên shape sẽ là (bsz, 1, projection_dim)
         loss = criterion(outputs, labels)
         
-
         losses.update(loss.item(), bsz)
   
         optimizer.zero_grad()
@@ -345,7 +343,7 @@ def train_classifier(train_loader, model, classifier, criterion, optimizer, epoc
         #warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
         
         with torch.no_grad():
-            features = model.encode(images) # (128, 1, 256)
+            features = model.encode(images) # (128, 128)
             
         output = classifier(features.detach()) #(128, 10)
         loss = criterion(output, labels)
