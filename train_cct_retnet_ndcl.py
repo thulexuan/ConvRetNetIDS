@@ -314,7 +314,7 @@ def train(train_loader, model, criterion, optimizer, epoch, opt, step):
 
         outputs = model(images) # (128, 10) 
         embeddings = model.encode(images) # (128, 128)
-        loss = criterion(images, labels, outputs, opt=opt)
+        loss = criterion(images, labels, outputs, epoch, opt=opt)
 
         # print('loss ce: ', ndcl_loss['loss_ce'])
         # print('loss con: ', ndcl_loss['loss_con'])

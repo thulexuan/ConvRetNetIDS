@@ -28,10 +28,10 @@ class NDCL(nn.Module):
         # end for k
         return loss / torch.unique(pos_y).size(0)
 
-    def _aug2(self, x, y, pred): # x là input ảnh thật
+    def _aug2(self, x, y, pred): # x là input ảnh thật, z -> embeddings after backbone, y -> labels, pred -> prediction probs sau khi qua softmax
         def lamd(alpha):
             lam = np.random.beta(alpha, alpha)
-            return max(lam, 0.8) 
+            return lam
 
         def obtain_num_from_pred(pred, k, thred):
             pos = torch.where(pred[:, k] >= thred)[0]
@@ -63,15 +63,35 @@ class NDCL(nn.Module):
                 num_gen[classes[i].item()] = num - 1 if redundant > 0 else num
                 redundant -= 1
         else:
-            total, classes, n_class = int(total * scaler), [], [] # total: tổng số augmented samples cần tạo
-            # class nào có số lượng samples trong batch nhiều hơn thì tạo nhiều augmented negative samples hơn
+            # total, classes, n_class = int(total * scaler), [], [] # total: tổng số augmented samples cần tạo
+            # # class nào có số lượng samples trong batch nhiều hơn thì tạo nhiều augmented negative samples hơn
+            # for k in torch.unique(y):
+            #     classes.append(k), n_class.append(y[y == k].size(0) / y.size(0)) # tính tỷ lệ samples của từng class trong batch
+            # ratio, start, cum = np.exp(n_class) / np.exp(n_class).sum(), 0, 0
+            # for ind in range(len(classes)):
+            #     cum += ratio[ind]
+            #     num_gen[classes[ind].item()] = int(np.ceil(cum * total)) - start
+            #     start += num_gen[classes[ind].item()]
+            total_aug = int(total * scaler)
+            classes, counts = [], []
+
             for k in torch.unique(y):
-                classes.append(k), n_class.append(y[y == k].size(0) / y.size(0)) # tính tỷ lệ samples của từng class trong batch
-            ratio, start, cum = np.exp(n_class) / np.exp(n_class).sum(), 0, 0
-            for ind in range(len(classes)):
+                classes.append(k)
+                counts.append(y[y == k].size(0))
+
+            counts = np.asarray(counts, dtype=np.float32)
+
+            gamma = 0.5
+            eps = 1e-6
+
+            inv = (counts.max() / (counts + eps)) ** gamma
+            ratio = inv / inv.sum()
+
+            start, cum = 0, 0
+            for ind, k in enumerate(classes):
                 cum += ratio[ind]
-                num_gen[classes[ind].item()] = int(np.ceil(cum * total)) - start
-                start += num_gen[classes[ind].item()]
+                num_gen[k.item()] = int(np.ceil(cum * total_aug)) - start
+                start += num_gen[k.item()]
         
         # print('print number of augmented negative samples of all classess (num_gen):', num_gen)
         # end calc
@@ -80,6 +100,12 @@ class NDCL(nn.Module):
         lam, device, aug, aug_y, n_class = lamd(alpha), x.device, [], [], pred.size(-1)
         for k in torch.unique(y):
             aug_pos, pos, neg, pred_pos, pred_neg = [], x[y == k], x[y != k], pred[y == k], pred[y != k]
+            # pos: embeddings của các samples có label = k, neg: embeddings của các samples có label != k
+            # pred_pos: prediction probs của các samples có label = k, pred_neg: prediction probs của các samples có label != k
+
+            # chọn pos: chọn sample có label = k, prob = k xếp theo thứ tự tăng dần
+            # chọn neg: chọn sample có label != k, prob = k xếp theo thứ tự giảm dần
+
             # asc sort neg though pred_neg[:, k]
             _, ind = torch.sort(pred_neg[:, k], descending=True)
             neg, pred_neg = neg[ind], pred_neg[ind]
@@ -87,8 +113,10 @@ class NDCL(nn.Module):
             _, ind = torch.sort(pred_pos[:, k])
             pos, pred_pos = pos[ind], pred_pos[ind]
             # find neg mix instances (> 2/K)
-            num = obtain_num_from_pred(pred_neg, k, 2 / n_class)
-            large_num = obtain_num_from_pred(pred_neg, k, 1 / n_class)
+            # tính số hard negative samples được tạo ra cho mỗi class
+            # ví dụ với class = DoS, negative set có xác suất = {0.62, 0.4, 0.25, 0.12, 0.03} thì num = 3, large_num = 4
+            num = obtain_num_from_pred(pred_neg, k, 1 / n_class)
+            large_num = obtain_num_from_pred(pred_neg, k, 0.05 / n_class)
             if pos.size(0) == 1:
                 # n_min: minimum amount of instances
                 lam_1, n_sampling, n_min = lam, neg.size(0) // 2, int(np.ceil(num_gen[k.item()] / 3))
@@ -116,6 +144,7 @@ class NDCL(nn.Module):
                 # amount of positive instances > 1
                 n_sampling = 0
                 for per in [0.25, 0.5, 0.75]:
+                    # n_pos: number of positive instances to be mixed, is_diversity: whether to use diversity-enhanced mixup
                     n_pos, is_diversity = int(np.ceil(pos.size(0) * per)), False
                     if n_pos == 1:
                         continue
@@ -135,6 +164,9 @@ class NDCL(nn.Module):
                         break
                 # end for per
                 # adjust amount of sampling instances from neg
+
+                # print("Print value of is_diversity:", is_diversity)
+
                 n_sampling = n_sampling if n_sampling != 0 else \
                     (neg.size(0) if neg.size(0) < int(np.ceil(num_gen[k.item()] / n_pos)) else int(np.ceil(num_gen[k.item()] / n_pos)))
                 ending, pos, neg = 0, pos[:n_pos], neg[:n_sampling]
@@ -160,13 +192,18 @@ class NDCL(nn.Module):
         # end for k
         return torch.cat(aug, dim=0), torch.cat(aug_y, dim=0)
 
-    def forward(self, images, labels, logits, unlabeled=None, opt=None):
+    def forward(self, images, labels, logits, epoch, unlabeled=None, opt=None):
 
         # print('print the number of unique labels:', torch.unique(labels).size(-1))
+        
         # calc all predict results
         pred = logits # (128, 10), output của backbone, chưa qua softmax, còn là logits
         each_loss = F.cross_entropy(pred, labels, reduction='none') # (128,), cross entropy loss cho từng instance, chưa qua softmax để thành xác suất
         pred = F.softmax(pred, dim=-1) # đưa logits qua softmax -> tính được prediction probs, here pred (128, 10)
+
+        torch.set_printoptions(profile="full", sci_mode=False)
+        # print("Show probability after softmax (pred):", pred[:10])
+        # print("Show labels", labels[:10])
 
         cls_loss = torch.tensor([0.], device=opt.device) # 10 elements
         for k in torch.unique(labels): # for each label, có tất cả 10 labels
@@ -179,7 +216,7 @@ class NDCL(nn.Module):
         # margin loss
         # margin_loss = torch.tensor([0.], device=device)
         aug, aug_y = self._aug2(images, labels, pred)
-        if aug is not None:
+        if aug is not None and epoch >= 20:
             aug_pred = F.softmax(self.model(aug), dim=-1)
             margin_loss = self._margin_loss(pred, aug_pred, labels, aug_y)
         else:

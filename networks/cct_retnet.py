@@ -22,57 +22,6 @@ def pair(t):
 
 __all__ = ['cct_2', 'cct_4', 'cct_6', 'cct_7', 'cct_8', 'cct_14', 'cct_16']
 
-
-def cct_2(*args, **kwargs):
-    return _cct(num_layers=2, num_heads=2, mlp_ratio=1, embedding_dim=128,
-                *args, **kwargs)
-
-
-def cct_4(*args, **kwargs):
-    return _cct(num_layers=4, num_heads=2, mlp_ratio=1, embedding_dim=128,
-                *args, **kwargs)
-
-
-def cct_6(*args, **kwargs):
-    return _cct(num_layers=6, num_heads=4, mlp_ratio=2, embedding_dim=256,
-                *args, **kwargs)
-
-
-def cct_7(*args, **kwargs):
-    return _cct(num_layers=7, num_heads=4, mlp_ratio=2, embedding_dim=256,
-                *args, **kwargs)
-
-
-def cct_8(*args, **kwargs):
-    return _cct(num_layers=8, num_heads=4, mlp_ratio=2, embedding_dim=256,
-                *args, **kwargs)
-
-
-def cct_14(*args, **kwargs):
-    return _cct(num_layers=14, num_heads=6, mlp_ratio=3, embedding_dim=384,
-                *args, **kwargs)
-
-
-def cct_16(*args, **kwargs):
-    return _cct(num_layers=16, num_heads=6, mlp_ratio=3, embedding_dim=384,
-                *args, **kwargs)
-
-
-def _cct(num_layers, num_heads, mlp_ratio, embedding_dim,
-         kernel_size=3, stride=None, padding=None,
-         *args, **kwargs):
-    stride = default(stride, max(1, (kernel_size // 2) - 1))
-    padding = default(padding, max(1, (kernel_size // 2)))
-
-    return CCT(num_layers=num_layers,
-               num_heads=num_heads,
-               mlp_ratio=mlp_ratio,
-               embedding_dim=embedding_dim,
-               kernel_size=kernel_size,
-               stride=stride,
-               padding=padding,
-               *args, **kwargs)
-
 # positional
 
 def sinusoidal_embedding(n_channels, dim):
@@ -83,66 +32,6 @@ def sinusoidal_embedding(n_channels, dim):
     return rearrange(pe, '... -> 1 ...')
 
 # modules
-
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, attention_dropout=0.1, projection_dropout=0.1):
-        super().__init__()
-        self.heads = num_heads
-        head_dim = dim // self.heads
-        self.scale = head_dim ** -0.5
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=False)
-        self.attn_drop = nn.Dropout(attention_dropout)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(projection_dropout)
-
-    def forward(self, x):
-        B, N, C = x.shape
-
-        qkv = self.qkv(x).chunk(3, dim = -1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
-
-        q = q * self.scale
-
-        attn = einsum('b h i d, b h j d -> b h i j', q, k)
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = einsum('b h i j, b h j d -> b h i d', attn, v)
-        x = rearrange(x, 'b h n d -> b n (h d)')
-
-        return self.proj_drop(self.proj(x))
-
-
-class TransformerEncoderLayer(nn.Module):
-    """
-    Inspired by torch.nn.TransformerEncoderLayer and
-    rwightman's timm package.
-    """
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1,
-                 attention_dropout=0.1, drop_path_rate=0.1):
-        super().__init__()
-
-        self.pre_norm = nn.LayerNorm(d_model)
-        self.self_attn = Attention(dim=d_model, num_heads=nhead,
-                                   attention_dropout=attention_dropout, projection_dropout=dropout)
-
-        self.linear1  = nn.Linear(d_model, dim_feedforward)
-        self.dropout1 = nn.Dropout(dropout)
-        self.norm1    = nn.LayerNorm(d_model)
-        self.linear2  = nn.Linear(dim_feedforward, d_model)
-        self.dropout2 = nn.Dropout(dropout)
-
-        self.drop_path = DropPath(drop_path_rate)
-
-        self.activation = F.gelu
-
-    def forward(self, src, *args, **kwargs): # src = a sequence of token embeddings, shape is (batch_size, sequence_length, embedding_dim)
-        src = src + self.drop_path(self.self_attn(self.pre_norm(src)))
-        src = self.norm1(src)
-        src2 = self.linear2(self.dropout1(self.activation(self.linear1(src))))
-        src = src + self.drop_path(self.dropout2(src2))
-        return src
 
 class DropPath(nn.Module):
     def __init__(self, drop_prob=None):
@@ -254,15 +143,9 @@ class TransformerClassifier(nn.Module):
 
         self.dropout = nn.Dropout(p=dropout_rate)
 
-        dpr = [x.item() for x in torch.linspace(0, stochastic_depth_rate, num_layers)]
+        # dpr = [x.item() for x in torch.linspace(0, stochastic_depth_rate, num_layers)]
 
         config = RetNetConfig(vocab_size=-1)
-
-        self.blocks = nn.ModuleList([
-            TransformerEncoderLayer(d_model=embedding_dim, nhead=num_heads,
-                                    dim_feedforward=dim_feedforward, dropout=dropout_rate,
-                                    attention_dropout=attention_dropout, drop_path_rate=layer_dpr)
-            for layer_dpr in dpr])
         
         self.retnet_blocks = RetNetDecoder(args=config)
 
@@ -297,8 +180,11 @@ class TransformerClassifier(nn.Module):
 
         return x # shape is (128, 256)
 
-    def forward(self, x): # (128, 256)
+    def forward(self, x): # x ~ raw input image (128, 256)
         return self.fc(self.get_features(x)) # (128, 10)
+
+    def get_logits_from_embeddings(self, embeddings): # embedding ~ (128, 256)
+        return self.fc(embeddings) # (128, 10)
 
     @staticmethod
     def init_weight(m):
