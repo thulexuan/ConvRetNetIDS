@@ -5,7 +5,7 @@ import numpy as np
 
 
 class PaCoLoss(nn.Module):
-    def __init__(self, alpha=1.0, beta=1.0, gamma=1.0, supt=1.0, temperature=1.0, base_temperature=None, K=8192, num_classes=10, smooth=0.0):
+    def __init__(self, alpha=0.05, beta=1.0, gamma=1.0, supt=1.0, temperature=0.07, base_temperature=None, K=8192, num_classes=10, smooth=0.0):
         super(PaCoLoss, self).__init__()
         self.temperature = temperature
         self.beta = beta
@@ -81,7 +81,7 @@ class PaCoLoss(nn.Module):
 
 
 class MultiTaskLoss(nn.Module):
-    def __init__(self, alpha=1.0, beta=1.0, gamma=1.0, supt=1.0, temperature=1.0, base_temperature=None, K=8192, num_classes=10):
+    def __init__(self, alpha=0.05, beta=1.0, gamma=1.0, supt=1.0, temperature=0.07, base_temperature=None, K=8192, num_classes=10):
         super(MultiTaskLoss, self).__init__()
         self.temperature = temperature
         self.base_temperature = temperature if base_temperature is None else base_temperature
@@ -148,7 +148,7 @@ class MultiTaskLoss(nn.Module):
 
 
 class MultiTaskBLoss(nn.Module):
-    def __init__(self, alpha=1.0, beta=1.0, gamma=1.0, supt=1.0, temperature=1.0, base_temperature=None, K=8192, num_classes=10):
+    def __init__(self, alpha=0.05, beta=1.0, gamma=1.0, supt=1.0, temperature=0.07, base_temperature=None, K=8192, num_classes=10):
         super(MultiTaskBLoss, self).__init__()
         self.temperature = temperature
         self.base_temperature = temperature if base_temperature is None else base_temperature

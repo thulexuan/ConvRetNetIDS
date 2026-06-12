@@ -20,12 +20,12 @@ from datetime import datetime
 from networks.resnet_big import LinearClassifier
 from supcon.losses import SupConLoss
 from supcon.util import accuracy
-from tsc_oneview_implementation.tsc_oneview_loss import TSCOneViewLoss
-from util import AverageMeter
+from util import AddGaussianNoise, AverageMeter, TwoCropTransform
 from util import warmup_learning_rate
 from util import save_model
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
 from torch.utils.tensorboard import SummaryWriter
+from torchvision import transforms
 
 from networks.cct_retnet import CCTRetNet
 
@@ -147,6 +147,9 @@ def parse_option():
                         help='id for recording multiple runs')
     parser.add_argument('--early_stop_patience', type=int, default=20,
                         help='patience for early stopping')
+    # model parameters 
+    parser.add_argument('--embedding_dim', type=int, default=128,
+                        help='dimension of the embedding layer')
     
     # settings for RetNet config
     
@@ -214,12 +217,34 @@ def calculate_class_counts(dataset, num_classes=10):
     return class_counts
 
 def set_loader(opt):
-    train_dataset = CANDataset(root_dir=opt.data_folder, window_size=32, is_train=True, is_test=False)
-    test_dataset = CANDataset(root_dir=opt.data_folder, window_size=32, is_train=False, is_test=False, include_data=False)
+
+    mean = (0.5, 0.5, 0.5)
+    std = (0.5, 0.5, 0.5)
+    normalize = transforms.Normalize(mean=mean, std=std)
+    transform = transforms.Compose([normalize])
+    train_transform = transforms.Compose([
+        transforms.RandomApply([AddGaussianNoise(0., 0.05)], p=0.5),
+        transforms.RandomErasing(p=0.3, scale=(0.02, 0.15)),
+        transforms.Normalize(mean=mean, std=std)
+    ])
+
+    train_dataset = CANDataset(root_dir=opt.data_folder, window_size=32, is_train=True, is_test=False, transform=TwoCropTransform(train_transform))
+    test_dataset = CANDataset(root_dir=opt.data_folder, window_size=32, is_train=False, is_test=False, include_data=False, transform=transform)
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers, pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.batch_size, shuffle=False, pin_memory=True)
     train_classifier_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers, pin_memory=True)
+
+    print('Number of training samples: {}'.format(len(train_dataset)))
+    image, label = train_dataset[2]
+    image_2, label_2 = train_dataset[3]
+    # image_1, label = train_dataset[1]
+    # print('The first training sample shape: ', image[0].shape, image[1].shape, label)
+    # torch.set_printoptions(profile="full")
+    # print('The first view of the first training sample: ', image[0])
+    # print('The second view of the first training sample: ', image[1])
+    # print('The first view of the second training sample: ', image_1[0])
+    # print('The second view of the second training sample: ', image_1[1])
 
     class_counts = calculate_class_counts(train_dataset, num_classes=opt.n_classes)
     print('Class counts in training dataset:', class_counts)
@@ -231,7 +256,7 @@ def set_model(opt):
     
     model = CCTRetNet(
         img_size = 64,
-        embedding_dim = 128, # the number of filters in the convolutional layers = the dimension of tokens before put into transformer encoder
+        embedding_dim = opt.embedding_dim, # the number of filters in the convolutional layers = the dimension of tokens before put into transformer encoder
         n_conv_layers = 2, # number of convolutional layers
         kernel_size = 3,
         stride = 1,
@@ -242,13 +267,13 @@ def set_model(opt):
         num_layers = 2, # the number of transformer encoder layers
         num_heads = 2, # the number of attention heads in each transformer encoder layer
         mlp_ratio = 2.5, # dim feedforward layer = embedding_dim * mlp_ratio, current case = 128 * 2.5 = 320
-        num_classes = 10,
+        num_classes = opt.n_classes,
         positional_embedding = 'learnable', # ['sine', 'learnable', 'none']
     )
 
     criterion_model = PaCoLoss()
 
-    classifier = LinearClassifier(num_classes=opt.n_classes, feat_dim=256)
+    classifier = LinearClassifier(num_classes=opt.n_classes, feat_dim=opt.embedding_dim)
     criterion_classifier = torch.nn.CrossEntropyLoss()
 
     model = model.to(opt.device)
@@ -315,16 +340,31 @@ def train(train_loader, model, criterion, optimizer, epoch, opt, step):
         step += 1
         data_time.update(time.time() - end)
         
-        images = images.to(opt.device, non_blocking=True) # images shape: (bsz, sequence_length, embedding_dim) ~ (128, 64*64, 256)
+        images[0] = images[0].to(opt.device, non_blocking=True) # images shape: (bsz, sequence_length, embedding_dim) ~ (128, 64*64, 256)
+        images[1] = images[1].to(opt.device, non_blocking=True) # images shape: (bsz, sequence_length, embedding_dim) ~ (128, 64*64, 256)
         labels = labels.to(opt.device, non_blocking=True) # labels shape: (bsz)~ (128)
         bsz = labels.shape[0]
 
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
         # here, model is CCTRetNet
-        output_features = model.encode(images) # (128, 128)
-        outputs = F.normalize(model.projection(output_features), dim=1) # (128, 64)
-        logits = model(images) # (128, 10)
+        # compute output features for both views
+        output_image_1 = model(images[0]) # (128, 64)
+        output_image_2 = model(images[1]) # (128, 64)
+
+        outputs = torch.cat((output_image_1, output_image_2), dim=0)
+
+        # compute logits for GPaCo loss
+        logit_1 = model.fc(model.encode(images[0])) # (128, 10)
+        logit_2 = model.fc(model.encode(images[1])) # (128, 10)
+        logits = torch.cat((logit_1, logit_2), dim=0) # (256, 10)
+
+        # concat labels for both views
+        labels = torch.cat((labels, labels), dim=0) # (256)
+
+        # print('Output features shape: ', outputs.shape)
+        # print('Logits shape: ', logits.shape)
+        # print('Labels shape: ', labels.shape)
 
         # outputs = outputs.unsqueeze(1) # tạo thêm 1 chiều cho n_views, ở đây n_views = 1, nên shape sẽ là (bsz, 1, projection_dim)
         loss = criterion(outputs, labels, logits)
@@ -363,14 +403,14 @@ def train_classifier(train_loader, model, classifier, criterion, optimizer, epoc
     for idx, (images, labels) in tqdm(enumerate(train_loader)):
         step += 1
         if torch.cuda.is_available():
-            images = images.cuda(non_blocking=True)
+            images[0] = images[0].to(opt.device, non_blocking=True)
             labels = labels.cuda(non_blocking=True)
         bsz = labels.shape[0]
         
         #warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
         
         with torch.no_grad():
-            features = model.encode(images) # (128, 128)
+            features = model.encode(images[0]) # (128, 128)
             
         output = classifier(features.detach()) #(128, 10)
         loss = criterion(output, labels)
@@ -495,8 +535,8 @@ def main():
         # train model with supcon loss
         new_step, train_loss = train(train_loader, model, criterion_model, optimizer, epoch, opt, step)
 
-        print(f'Epoch {epoch}, CCT-RetNet-SupCon Loss {train_loss:.4f}')
-        log_writer.write(f'Epoch: {epoch}, CCT-RetNet-SupCon Loss: {train_loss:.4f}\n')
+        print(f'Epoch {epoch}, CCT-RetNet-GPaCo Loss {train_loss:.4f}')
+        log_writer.write(f'Epoch: {epoch}, CCT-RetNet-GPaCo Loss: {train_loss:.4f}\n')
         logger.add_scalar('train_loss/val', train_loss, step)
         train_supcon_losses.append(train_loss)
         print('Train SupCon Losses:', train_supcon_losses)

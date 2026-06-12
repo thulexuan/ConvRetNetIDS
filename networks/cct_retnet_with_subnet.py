@@ -1,0 +1,267 @@
+import torch
+from torch import nn, einsum
+import torch.nn.functional as F
+
+from einops import rearrange, repeat
+
+from networks.torchscale.architecture.retnet import RetNetDecoder
+from networks.torchscale.config.config import RetNetConfig
+
+# helpers
+
+def exists(val):
+    return val is not None
+
+def default(val, d):
+    return val if exists(val) else d
+
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)
+
+# CCT Models
+
+__all__ = ['cct_2', 'cct_4', 'cct_6', 'cct_7', 'cct_8', 'cct_14', 'cct_16']
+
+# positional
+
+def sinusoidal_embedding(n_channels, dim):
+    pe = torch.FloatTensor([[p / (10000 ** (2 * (i // 2) / dim)) for i in range(dim)]
+                            for p in range(n_channels)])
+    pe[:, 0::2] = torch.sin(pe[:, 0::2])
+    pe[:, 1::2] = torch.cos(pe[:, 1::2])
+    return rearrange(pe, '... -> 1 ...')
+
+# modules
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=None):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x):
+        batch, drop_prob, device, dtype = x.shape[0], self.drop_prob, x.device, x.dtype
+
+        if drop_prob <= 0. or not self.training:
+            return x
+
+        keep_prob = 1 - self.drop_prob
+        shape = (batch, *((1,) * (x.ndim - 1)))
+
+        keep_mask = torch.zeros(shape, device = device).float().uniform_(0, 1) < keep_prob
+        output = x.div(keep_prob) * keep_mask.float()
+        return output
+
+class Tokenizer(nn.Module):
+    def __init__(self,
+                 kernel_size, stride, padding,
+                 pooling_kernel_size=3, pooling_stride=2, pooling_padding=1,
+                 n_conv_layers=1,
+                 n_input_channels=3,
+                 n_output_channels=64,  # = embedding_dim 
+                 in_planes=64,
+                 activation=None,
+                 max_pool=True,
+                 conv_bias=False):
+        super().__init__()
+
+        n_filter_list = [n_input_channels] + \
+                        [in_planes for _ in range(n_conv_layers - 1)] + \
+                        [n_output_channels] # build list các convolutional layer, if 1 layer, biến đổi từ 3 channel qua embedding_dim channel, if 2 layer, biến đổi từ 3 channel qua in_planes channel rồi qua embedding_dim channel
+
+        n_filter_list_pairs = zip(n_filter_list[:-1], n_filter_list[1:])
+
+        self.conv_layers = nn.Sequential(
+            *[nn.Sequential(
+                nn.Conv2d(chan_in, chan_out,
+                          kernel_size=(kernel_size, kernel_size),
+                          stride=(stride, stride),
+                          padding=(padding, padding), bias=conv_bias),
+                nn.Identity() if not exists(activation) else activation(),
+                nn.MaxPool2d(kernel_size=pooling_kernel_size,
+                             stride=pooling_stride,
+                             padding=pooling_padding) if max_pool else nn.Identity()
+            )
+                for chan_in, chan_out in n_filter_list_pairs
+            ])
+
+        self.apply(self.init_weight)
+
+    def sequence_length(self, n_channels=3, height=64, width=64):
+        return self.forward(torch.zeros((1, n_channels, height, width))).shape[1]
+
+    def forward(self, x):
+        # print("Investigating the input x after convolution but before rearrange: ", self.conv_layers(x).shape) # expected shape is (batch_size, 3, 64, 64)
+        return rearrange(self.conv_layers(x), 'b c h w -> b (h w) c')
+
+    @staticmethod
+    def init_weight(m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight)
+
+
+class TransformerClassifier(nn.Module):
+    def __init__(self,
+                 seq_pool=True,
+                 embedding_dim=128, # 256
+                 num_layers=12, # 2
+                 num_heads=12, # 2
+                 mlp_ratio=4.0, # 1
+                 num_classes=10,
+                 dropout_rate=0.1,
+                 attention_dropout=0.1,
+                 stochastic_depth_rate=0.1,
+                 positional_embedding='sine',
+                 sequence_length=None,
+                 *args, **kwargs):
+        super().__init__()
+        assert positional_embedding in {'sine', 'learnable', 'none'}
+
+        dim_feedforward = int(embedding_dim * mlp_ratio)
+        self.embedding_dim = embedding_dim
+        self.sequence_length = sequence_length
+        self.seq_pool = seq_pool
+
+        assert exists(sequence_length) or positional_embedding == 'none', \
+            f"Positional embedding is set to {positional_embedding} and" \
+            f" the sequence length was not specified."
+
+        if not seq_pool:  # if not using sequence pooling, add a class token and increase the sequence length by 1
+            sequence_length += 1
+            self.class_emb = nn.Parameter(torch.zeros(1, 1, self.embedding_dim), requires_grad=True)
+        else:
+            self.attention_pool = nn.Linear(self.embedding_dim, 1)
+
+        if positional_embedding == 'none':
+            self.positional_emb = None
+        elif positional_embedding == 'learnable':
+            self.positional_emb = nn.Parameter(torch.zeros(1, sequence_length, embedding_dim),
+                                               requires_grad=True)
+            nn.init.trunc_normal_(self.positional_emb, std=0.2)
+        else:
+            self.positional_emb = nn.Parameter(sinusoidal_embedding(sequence_length, embedding_dim),
+                                               requires_grad=False)
+
+        self.dropout = nn.Dropout(p=dropout_rate)
+
+        # dpr = [x.item() for x in torch.linspace(0, stochastic_depth_rate, num_layers)]
+
+        config = RetNetConfig(vocab_size=-1)
+        
+        self.retnet_blocks = RetNetDecoder(args=config)
+
+        self.norm = nn.LayerNorm(embedding_dim)
+
+        self.fc = nn.Linear(embedding_dim, num_classes)
+        self.apply(self.init_weight)
+
+    def forward(self, x): # when call Transformer Classifier, put x is a sequence of tokens
+        # print("Investigating the input x of Transformer Classifier: ", x.shape) # expectedshape is (batch_size, sequence_length, embedding_dim)
+        b = x.shape[0]
+
+        if not exists(self.positional_emb) and x.size(1) < self.sequence_length:
+            x = F.pad(x, (0, 0, 0, self.n_channels - x.size(1)), mode='constant', value=0)
+
+        if not self.seq_pool:
+            cls_token = repeat(self.class_emb, '1 1 d -> b 1 d', b = b)
+            x = torch.cat((cls_token, x), dim=1)
+
+        if exists(self.positional_emb):
+            x += self.positional_emb
+
+        
+        # with RetNet
+        x, _ = self.retnet_blocks(prev_output_tokens=x, token_embeddings=x) # (batch_size, sequence_length, embedding_dim)
+                
+        if self.seq_pool:
+            attn_weights = rearrange(self.attention_pool(x), 'b n 1 -> b n')
+            x = einsum('b n, b n d -> b d', attn_weights.softmax(dim = 1), x)
+        else:
+            x = x[:, -1] # get the last token, shape is (batch_size, embedding_dim)
+
+        return x # shape is (128, 256)
+
+    @staticmethod
+    def init_weight(m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and exists(m.bias):
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+# CCT-RetNet Main model
+
+class CCTRetNetWithSubNet(nn.Module):
+    def __init__(
+        self,
+        img_size=64,
+        embedding_dim=128, # dimension of each token after tokenization = the number of filters in convolutional layers
+        n_input_channels=3,
+        n_conv_layers=2,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        pooling_kernel_size=2,
+        pooling_stride=2,
+        pooling_padding=0,
+        dropout_rate=0.,
+        attention_dropout=0.1,
+        stochastic_depth_rate=0.1,
+        projection_head='mlp',
+        projection_dim=64,
+        *args, **kwargs
+    ):
+        super().__init__()
+        img_height, img_width = pair(img_size)
+
+        self.tokenizer = Tokenizer(n_input_channels=n_input_channels,  # number of channels in the input image. after implementing convolution, image from [3, 64, 64] -> [embedding_dim, 64, 64]
+                                   n_output_channels=embedding_dim, # the number of filters
+                                   kernel_size=kernel_size,  # kernel size for convolutional layers
+                                   stride=stride,
+                                   padding=padding,
+                                   pooling_kernel_size=pooling_kernel_size,
+                                   pooling_stride=pooling_stride,
+                                   pooling_padding=pooling_padding,
+                                   max_pool=True,
+                                   activation=nn.ReLU,
+                                   n_conv_layers=n_conv_layers, # number of comvolutional layers
+                                   conv_bias=False)
+
+        self.encoder = TransformerClassifier(
+            sequence_length=self.tokenizer.sequence_length(n_channels=n_input_channels, # number of channels in the input image (3)
+                                                           height=img_height,
+                                                           width=img_width),
+            embedding_dim=embedding_dim, # 256
+            seq_pool=True,
+            dropout_rate=dropout_rate,
+            attention_dropout=attention_dropout,
+            stochastic_depth_rate=stochastic_depth_rate,
+            *args, **kwargs)
+        
+        # add projection head 
+        if projection_head == 'linear':
+            self.head = nn.Linear(embedding_dim, projection_dim)
+        elif projection_head == 'mlp':
+            self.head = nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(embedding_dim, projection_dim)
+            )
+        else:
+            raise NotImplementedError(
+                'head not supported: {}'.format(projection_head))
+    
+    def encode(self, x): # (128, 3, 64, 64)
+        x = self.tokenizer(x)
+        return self.encoder(x) # (128, 128)
+    
+    def projection(self, features): # (128, 128)
+        return self.head(features) # (128, 64)
+
+    def forward(self, x): # (128, 3, 64, 64)
+
+        x = self.encode(x)
+        x = self.head(x) # (128, 64)
+
+        return F.normalize(x, dim=1) # shape is (128, 64), L2-normalized
