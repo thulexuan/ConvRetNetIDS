@@ -148,7 +148,7 @@ def parse_option():
     parser.add_argument('--early_stop_patience', type=int, default=20,
                         help='patience for early stopping')
     # model parameters 
-    parser.add_argument('--embedding_dim', type=int, default=128,
+    parser.add_argument('--embedding_dim', type=int, default=256,
                         help='dimension of the embedding layer')
     
     # settings for RetNet config
@@ -264,8 +264,8 @@ def set_model(opt):
         pooling_kernel_size = 2,
         pooling_stride = 2,
         pooling_padding = 0,
-        num_layers = 2, # the number of transformer encoder layers
-        num_heads = 2, # the number of attention heads in each transformer encoder layer
+        num_layers = 4, # the number of transformer encoder layers
+        num_heads = 4, # the number of attention heads in each transformer encoder layer
         mlp_ratio = 2.5, # dim feedforward layer = embedding_dim * mlp_ratio, current case = 128 * 2.5 = 320
         num_classes = opt.n_classes,
         positional_embedding = 'learnable', # ['sine', 'learnable', 'none']

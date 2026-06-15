@@ -209,7 +209,7 @@ class CCTRetNet(nn.Module):
         attention_dropout=0.1,
         stochastic_depth_rate=0.1,
         projection_head='mlp',
-        projection_dim=64,
+        projection_dim=128,
         *args, **kwargs
     ):
         super().__init__()
