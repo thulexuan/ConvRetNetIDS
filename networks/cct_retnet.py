@@ -103,8 +103,8 @@ class TransformerClassifier(nn.Module):
     def __init__(self,
                  seq_pool=True,
                  embedding_dim=128, # 256
-                 num_layers=12, # 2
-                 num_heads=12, # 2
+                 n_layers=2, # 2
+                 n_heads=2, # 2
                  mlp_ratio=4.0, # 1
                  num_classes=10,
                  dropout_rate=0.1,
@@ -145,7 +145,14 @@ class TransformerClassifier(nn.Module):
 
         # dpr = [x.item() for x in torch.linspace(0, stochastic_depth_rate, num_layers)]
 
-        config = RetNetConfig(vocab_size=-1)
+        config = RetNetConfig(
+            vocab_size=-1,
+            decoder_embed_dim=embedding_dim, 
+            decoder_value_embed_dim=embedding_dim * 2,
+            decoder_retention_heads=n_heads,
+            decoder_ffn_embed_dim=embedding_dim * 2,
+            decoder_layers=n_layers
+        )
         
         self.retnet_blocks = RetNetDecoder(args=config)
 
@@ -209,7 +216,9 @@ class CCTRetNet(nn.Module):
         attention_dropout=0.1,
         stochastic_depth_rate=0.1,
         projection_head='mlp',
-        projection_dim=128,
+        projection_dim=64,
+        n_layers=2,
+        n_heads=2,
         *args, **kwargs
     ):
         super().__init__()
@@ -237,6 +246,8 @@ class CCTRetNet(nn.Module):
             dropout_rate=dropout_rate,
             attention_dropout=attention_dropout,
             stochastic_depth_rate=stochastic_depth_rate,
+            n_layers=2,
+            n_heads=2,
             *args, **kwargs)
     
         self.fc = nn.Linear(embedding_dim, 10) # for supervised loss, shape is (128, 10)
@@ -263,10 +274,10 @@ class CCTRetNet(nn.Module):
 
     def forward(self, x): # (128, 3, 64, 64)
 
-        x = self.encode(x)
-        x = self.head(x) # (128, 64)
+        x_before_projection = self.encode(x)
+        x_after_projection = self.head(x_before_projection) # (128, 64)
 
-        return F.normalize(x, dim=1) # shape is (128, 64), L2-normalized
+        return x_before_projection, F.normalize(x_after_projection, dim=1) # shape is (128, 64), L2-normalized
     
 class CCTRetNetNoProjectionHead(nn.Module):
     def __init__(

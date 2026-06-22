@@ -13,6 +13,7 @@ import torch.optim as optim
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import pprint
+from BPaCo.losses import BPaCoLoss
 from GPaCo.losses import PaCoLoss
 from dataset import CANDatasetEnet as CANDataset
 # from networks.vision_trans import CEViT
@@ -35,7 +36,7 @@ class EarlyStopping:
         self.delta = delta
         self.enabled = enabled
         self.counter = 0
-        self.best_score = None
+        self.best_score = -np.inf
         self.best_epoch = 0
         self.best_f1 = -np.inf
         self.early_stop = False
@@ -53,11 +54,6 @@ class EarlyStopping:
             self.val_loss_min_epoch = epoch
 
         score = val_f1
-
-        if self.best_score is None:
-            self.best_score = score
-            self.save_checkpoint(val_loss,val_f1,  model, optimizer, opt, epoch, path)
-            return True
 
         if score <= self.best_score + self.delta:
             self.counter += 1
@@ -148,10 +144,20 @@ def parse_option():
     parser.add_argument('--early_stop_patience', type=int, default=20,
                         help='patience for early stopping')
     # model parameters 
-    parser.add_argument('--embedding_dim', type=int, default=256,
+    parser.add_argument('--embedding_dim', type=int, default=128,
                         help='dimension of the embedding layer')
+    parser.add_argument('--projection_dim', type=int, default=64,
+                        help='dimension of the projection layer to train feature space')
     
     # settings for RetNet config
+    parser.add_argument('--n_layers', default=2, type=int,
+                    help='the number of RetNet blocks')
+    parser.add_argument('--n_heads', default=2, type=int,
+                    help='the number of RetNet retention layers in each block')
+
+    # loss configuration
+    parser.add_argument('--alpha', default=0.05, type=float,
+                    help='contrast weight among samples')
     
 
     opt = parser.parse_args()
@@ -236,19 +242,24 @@ def set_loader(opt):
     train_classifier_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers, pin_memory=True)
 
     print('Number of training samples: {}'.format(len(train_dataset)))
-    image, label = train_dataset[2]
-    image_2, label_2 = train_dataset[3]
-    # image_1, label = train_dataset[1]
-    # print('The first training sample shape: ', image[0].shape, image[1].shape, label)
-    # torch.set_printoptions(profile="full")
-    # print('The first view of the first training sample: ', image[0])
-    # print('The second view of the first training sample: ', image[1])
-    # print('The first view of the second training sample: ', image_1[0])
-    # print('The second view of the second training sample: ', image_1[1])
+    # torch.set_printoptions(
+    #     precision=4,
+    #     threshold=float("inf"), # no truncation of tensor elements
+    #     linewidth=200,
+    #     sci_mode=False   
+    # )
+    # print(train_dataset[0][0][1])
+    # num_unique = torch.unique(train_dataset[0][0][1])
+    # print(num_unique)
+    # print("--------")
+    # print(train_dataset[0][0][0])
+    # num_unique_1 = torch.unique(train_dataset[0][0][0])
+    # print(num_unique_1)
+    # print("---------")
 
-    class_counts = calculate_class_counts(train_dataset, num_classes=opt.n_classes)
-    print('Class counts in training dataset:', class_counts)
-    return train_loader, test_loader, train_classifier_loader, class_counts
+    # class_counts = calculate_class_counts(train_dataset, num_classes=opt.n_classes)
+    # print('Class counts in training dataset:', class_counts)
+    return train_loader, test_loader, train_classifier_loader
 
 
 def set_model(opt):
@@ -264,14 +275,17 @@ def set_model(opt):
         pooling_kernel_size = 2,
         pooling_stride = 2,
         pooling_padding = 0,
-        num_layers = 4, # the number of transformer encoder layers
-        num_heads = 4, # the number of attention heads in each transformer encoder layer
+        # num_layers = 4, # the number of transformer encoder layers
+        # num_heads = 4, # the number of attention heads in each transformer encoder layer
         mlp_ratio = 2.5, # dim feedforward layer = embedding_dim * mlp_ratio, current case = 128 * 2.5 = 320
         num_classes = opt.n_classes,
         positional_embedding = 'learnable', # ['sine', 'learnable', 'none']
+        projection_dim=opt.projection_dim,
+        n_layers=opt.n_layers,
+        n_heads=opt.n_heads
     )
 
-    criterion_model = PaCoLoss()
+    criterion_model = PaCoLoss(alpha=opt.alpha)
 
     classifier = LinearClassifier(num_classes=opt.n_classes, feat_dim=opt.embedding_dim)
     criterion_classifier = torch.nn.CrossEntropyLoss()
@@ -349,14 +363,14 @@ def train(train_loader, model, criterion, optimizer, epoch, opt, step):
 
         # here, model is CCTRetNet
         # compute output features for both views
-        output_image_1 = model(images[0]) # (128, 64)
-        output_image_2 = model(images[1]) # (128, 64)
+        output_image_1_before_proj, output_image_1_after_proj = model(images[0]) # (128, 64)
+        output_image_2_before_proj, output_image_2_after_proj = model(images[1]) # (128, 64)
 
-        outputs = torch.cat((output_image_1, output_image_2), dim=0)
+        outputs = torch.cat((output_image_1_after_proj, output_image_2_after_proj), dim=0)
 
         # compute logits for GPaCo loss
-        logit_1 = model.fc(model.encode(images[0])) # (128, 10)
-        logit_2 = model.fc(model.encode(images[1])) # (128, 10)
+        logit_1 = model.fc(output_image_1_before_proj) # (128, 10)
+        logit_2 = model.fc(output_image_2_before_proj) # (128, 10)
         logits = torch.cat((logit_1, logit_2), dim=0) # (256, 10)
 
         # concat labels for both views
@@ -434,7 +448,7 @@ def get_predict(outputs):
 
 def validate(val_loader, model, classifier, criterion, opt):
     model.eval()
-    classifier.eval()
+    # classifier.eval()
     
     losses = AverageMeter()
     total_pred = np.array([], dtype=int)
@@ -444,7 +458,8 @@ def validate(val_loader, model, classifier, criterion, opt):
         for images, labels in tqdm(val_loader): 
             images = images.to(opt.device, non_blocking=True)
             labels = labels.to(opt.device, non_blocking=True)
-            outputs = classifier(model.encode(images)) # shape is (batch_size, num_classes) after go through classifier
+            output_feature_before_proj, _ = model(images)
+            outputs = model.fc(output_feature_before_proj)
             bsz = labels.size(0)
             loss = criterion(outputs, labels)
             losses.update(loss.item(), bsz)
@@ -461,12 +476,13 @@ def validate(val_loader, model, classifier, criterion, opt):
             total_label = np.concatenate((total_label, labels), axis=0)
     
     f1 = f1_score(total_label, total_pred, average='weighted')
+    macro_f1 = f1_score(total_label, total_pred, average='macro')
     precision = precision_score(total_label, total_pred, average='weighted', zero_division=0)
     recall = recall_score(total_label, total_pred, average='weighted')
     conf_matrix = confusion_matrix(total_label, total_pred)
     accuracy = accuracy_score(total_label, total_pred)
     acc_percent = accuracy * 100 
-    return losses.avg, f1, precision, recall, conf_matrix, acc_percent
+    return losses.avg, f1, macro_f1, precision, recall, conf_matrix, acc_percent
 
 
 def adjust_learning_rate(args, optimizer, epoch, class_str=''):
@@ -497,9 +513,11 @@ def main():
 
     seed = 1
     torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
     # build data loader
-    train_loader, test_loader, train_classifier_loader, class_counts = set_loader(opt)
+    train_loader, test_loader, train_classifier_loader = set_loader(opt)
     model, criterion_model, classifier, criterion_classifier = set_model(opt)
 
     # build optimizer
@@ -517,19 +535,21 @@ def main():
 
     total_params = sum(p.numel() for p in model.parameters())
     log_writer.write(f'Total parameters: {total_params:,}\n')
+    log_writer.write(f'Print parametes: {str(opt)}\n')
+    log_writer.write(f'Model information: {model}\n')
 
-    early_stopping = EarlyStopping(patience=opt.early_stop_patience, delta=0.0, enabled=True)
-    final_epoch = start_epoch - 1
+    # early_stopping = EarlyStopping(patience=opt.early_stop_patience, delta=0.0, enabled=True)
+    # final_epoch = start_epoch - 1
 
     train_classification_losses = []
     train_supcon_losses = []
     val_losses = []
 
-    criterion_model.cal_weight_for_classes(class_counts)
+    # criterion_model.cal_weight_for_classes(class_counts)
 
     for epoch in range(start_epoch, opt.epochs + 1):
         print('Begin time: ' + str(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())))
-        final_epoch = epoch
+        # final_epoch = epoch
         adjust_learning_rate(opt, optimizer, epoch)
 
         # train model with supcon loss
@@ -539,73 +559,76 @@ def main():
         log_writer.write(f'Epoch: {epoch}, CCT-RetNet-GPaCo Loss: {train_loss:.4f}\n')
         logger.add_scalar('train_loss/val', train_loss, step)
         train_supcon_losses.append(train_loss)
-        print('Train SupCon Losses:', train_supcon_losses)
+        print('Train GPaCo Losses:', train_supcon_losses)
 
         # train and validate classifier with cross-entropy loss
-        class_epoch = epoch - opt.epoch_start_classifier + 1
-        if class_epoch > 0:
-            adjust_learning_rate(opt, classifier_optimizer, class_epoch, class_str='_classifier')
-            new_step, classifier_loss, classifier_acc = train_classifier(train_classifier_loader, model, classifier, criterion_classifier, classifier_optimizer, class_epoch, opt, new_step, logger)
-            train_classification_losses.append(classifier_loss)
-            print('Classifier: Loss: {:.4f}, Acc: {}'.format(classifier_loss, classifier_acc))
-            log_writer.write('Classifier: Loss: {:.4f}, Acc: {}\n'.format(classifier_loss, classifier_acc))
-            logger.add_scalar('classifier_loss/val', classifier_loss, step)
-            logger.add_scalar('classifier_acc/val', classifier_acc, step)
+        # class_epoch = epoch - opt.epoch_start_classifier + 1
+        # if class_epoch > 0:
+        #     adjust_learning_rate(opt, classifier_optimizer, class_epoch, class_str='_classifier')
+        #     new_step, classifier_loss, classifier_acc = train_classifier(train_classifier_loader, model, classifier, criterion_classifier, classifier_optimizer, class_epoch, opt, new_step, logger)
+        #     train_classification_losses.append(classifier_loss)
+        #     print('Classifier: Loss: {:.4f}, Acc: {}'.format(classifier_loss, classifier_acc))
+        #     log_writer.write('Classifier: Loss: {:.4f}, Acc: {}\n'.format(classifier_loss, classifier_acc))
+        #     logger.add_scalar('classifier_loss/val', classifier_loss, step)
+        #     logger.add_scalar('classifier_acc/val', classifier_acc, step)
 
-            loss, val_f1, precision, recall, conf_matrix, accuracy = validate(test_loader, model, classifier, criterion_classifier, opt)
-            logger.add_scalar('loss_ce/val', loss, step)
-            logger.add_scalar('acc/val', accuracy, step)
-            logger.add_scalar('val_f1/val', val_f1, step)
-            val_losses.append(loss)
+        loss, val_f1, macro_f1, precision, recall, conf_matrix, accuracy = validate(test_loader, model, classifier, criterion_classifier, opt)
+        logger.add_scalar('loss_ce/val', loss, step)
+        logger.add_scalar('acc/val', accuracy, step)
+        logger.add_scalar('val_f1/val', val_f1, step)
+        logger.add_scalar('macro_f1/val', macro_f1, step)
+        val_losses.append(loss)
 
-            log_writer.write(f'Accuracy: {accuracy:.4f}\n')
-            log_writer.write(f'F1 Score: {val_f1:.4f}\n')
-            log_writer.write(f'Precision: {precision:.4f}\n')
-            log_writer.write(f'Recall: {recall:.4f}\n')
-            log_writer.write(f'Confusion Matrix:\n{pp.pformat(conf_matrix)}\n')
+        log_writer.write(f'Accuracy: {accuracy:.4f}\n')
+        log_writer.write(f'F1 Score: {val_f1:.4f}\n')
+        log_writer.write(f'Macro F1 Score: {macro_f1:.4f}\n')
+        log_writer.write(f'Precision: {precision:.4f}\n')
+        log_writer.write(f'Recall: {recall:.4f}\n')
+        log_writer.write(f'Confusion Matrix:\n{pp.pformat(conf_matrix)}\n')
 
-            # early stopping
-            improved = early_stopping(
-                loss,
-                val_f1,
-                model,
-                optimizer,
-                opt,
-                epoch,
-                opt.save_folder
-            )
+        # early stopping
+        # improved = early_stopping(
+        #     loss,
+        #     macro_f1,
+        #     model,
+        #     optimizer,
+        #     opt,
+        #     epoch,
+        #     opt.save_folder
+        # )
 
-            if improved:
-                log_writer.write(
-                    f'Best checkpoint updated at epoch {early_stopping.best_epoch} '
-                    f'(val F1 {early_stopping.best_f1:.4f})\n'
-                )
-            else: 
-                log_writer.write(
-                    f'Early stop counter: {early_stopping.counter}/{opt.early_stop_patience} '
-                    f'(best val F1 {early_stopping.best_f1:.4f} at epoch {early_stopping.best_epoch})\n'    
-                )
+        # if improved:
+        #     log_writer.write(
+        #         f'Best checkpoint updated at epoch {early_stopping.best_epoch} '
+        #         f'(val F1 {early_stopping.best_f1:.4f})\n'
+        #     )
+        # else: 
+        #     log_writer.write(
+        #         f'Early stop counter: {early_stopping.counter}/{opt.early_stop_patience} '
+        #         f'(best val F1 {early_stopping.best_f1:.4f} at epoch {early_stopping.best_epoch})\n'    
+        #     )
 
-            # Print results
-            print(f'Validation loss: {loss:.4f}')
-            print(f'Accuracy: {accuracy:.4f}')
-            print(f'F1 Score: {val_f1:.4f}')
-            print(f'Precision: {precision:.4f}')
-            print(f'Recall: {recall:.4f}')
-            print(f'Best validation F1: {early_stopping.best_f1:.4f} at epoch {early_stopping.best_epoch}')
-            print(f'Min validation loss: {early_stopping.val_loss_min:.4f} at epoch {early_stopping.val_loss_min_epoch}')
-            print('Confusion Matrix:')
-            print(conf_matrix)
-            print('Train Classification Losses:', train_classification_losses)
-            
-            print('Validation Losses:', val_losses)
+        # Print results
+        print(f'Validation loss: {loss:.4f}')
+        print(f'Accuracy: {accuracy:.4f}')
+        print(f'F1 Score: {val_f1:.4f}')
+        print(f'Macro F1 Score: {macro_f1:.4f}')
+        print(f'Precision: {precision:.4f}')
+        print(f'Recall: {recall:.4f}')
+        # print(f'Best validation F1: {early_stopping.best_f1:.4f} at epoch {early_stopping.best_epoch}')
+        # print(f'Min validation loss: {early_stopping.val_loss_min:.4f} at epoch {early_stopping.val_loss_min_epoch}')
+        print('Confusion Matrix:')
+        print(conf_matrix)
+        # print('Train Classification Losses:', train_classification_losses)
+        
+        print('Validation Losses:', val_losses)
 
-       
+    
 
-            if (class_epoch % 10 == 0):
-                print('Saving model at epoch {}...'.format(epoch))
-                classifier_save_file = os.path.join(opt.save_folder, f'classifier_ckpt_epoch_{class_epoch}.pth')
-                save_model(classifier, classifier_optimizer, opt, class_epoch, classifier_save_file)
+        # if (class_epoch % 10 == 0):
+        #     print('Saving model at epoch {}...'.format(epoch))
+        #     classifier_save_file = os.path.join(opt.save_folder, f'classifier_ckpt_epoch_{class_epoch}.pth')
+        #     save_model(classifier, classifier_optimizer, opt, class_epoch, classifier_save_file)
 
         step = new_step
         # Save checkpoint 
@@ -614,24 +637,24 @@ def main():
             model_save_file = os.path.join(opt.save_folder, f'ckpt_epoch_{epoch}.pth')
             save_model(model, optimizer, opt, epoch, model_save_file)
 
-        if early_stopping.early_stop:
-            print(
-                f'Early stopping at epoch {epoch}. '
-                f'Best validation F1 {early_stopping.best_f1:.4f} at epoch {early_stopping.best_epoch}. '
-                f'Min validation loss {early_stopping.val_loss_min:.4f} at epoch {early_stopping.val_loss_min_epoch}.'
-            )
-            log_writer.write(
-                f'Early stopping at epoch {epoch}. '
-                f'Best validation F1 {early_stopping.best_f1:.4f} at epoch {early_stopping.best_epoch}. '
-                f'Min validation loss {early_stopping.val_loss_min:.4f} at epoch {early_stopping.val_loss_min_epoch}.\n'
-            )
-            break
+        # if early_stopping.early_stop:
+        #     print(
+        #         f'Early stopping at epoch {epoch}. '
+        #         f'Best validation F1 {early_stopping.best_f1:.4f} at epoch {early_stopping.best_epoch}. '
+        #         f'Min validation loss {early_stopping.val_loss_min:.4f} at epoch {early_stopping.val_loss_min_epoch}.'
+        #     )
+        #     log_writer.write(
+        #         f'Early stopping at epoch {epoch}. '
+        #         f'Best validation F1 {early_stopping.best_f1:.4f} at epoch {early_stopping.best_epoch}. '
+        #         f'Min validation loss {early_stopping.val_loss_min:.4f} at epoch {early_stopping.val_loss_min_epoch}.\n'
+        #     )
+        #     break
 
     # save last checkpoint after training is done
     model_save_file = os.path.join(opt.save_folder, f'last.pth')
-    classifier_save_file = os.path.join(opt.save_folder, f'classifier_last.pth')
+    # classifier_save_file = os.path.join(opt.save_folder, f'classifier_last.pth')
     save_model(model, optimizer, opt, epoch, model_save_file)
-    save_model(classifier, classifier_optimizer, opt, class_epoch, classifier_save_file)
+    # save_model(classifier, classifier_optimizer, opt, class_epoch, classifier_save_file)
     
 if __name__ == '__main__':
     main()
