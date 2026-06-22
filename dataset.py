@@ -70,6 +70,7 @@ class CANDatasetEnet(Dataset):
         self.transform = transform
         self.window_size = window_size
         self.total_size = len(os.listdir(self.root_dir))
+        self.cls_num_list = None
     
     def __getitem__(self, idx):
         filenames = '{}/{}.tfrec'.format(self.root_dir, idx)

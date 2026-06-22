@@ -205,22 +205,22 @@ def parse_option():
     return opt
 
 def calculate_class_counts(dataset, num_classes=10):
-    class_counts = torch.zeros(num_classes, dtype=torch.long)
+        class_counts = torch.zeros(num_classes, dtype=torch.long)
 
-    for idx in tqdm(range(len(dataset)), desc="Counting class labels"):
-        _, label = dataset[idx]
+        for idx in tqdm(range(len(dataset)), desc="Counting class labels"):
+            _, label = dataset[idx]
 
-        if torch.is_tensor(label):
-            label = label.item()
+            if torch.is_tensor(label):
+                label = label.item()
 
-        label = int(label)
+            label = int(label)
 
-        if label < 0 or label >= num_classes:
-            raise ValueError(f"Invalid label {label} at index {idx}")
+            if label < 0 or label >= num_classes:
+                raise ValueError(f"Invalid label {label} at index {idx}")
 
-        class_counts[label] += 1
+            class_counts[label] += 1
 
-    return class_counts
+        return class_counts
 
 def set_loader(opt):
 
@@ -248,21 +248,12 @@ def set_loader(opt):
     #     linewidth=200,
     #     sci_mode=False   
     # )
-    # print(train_dataset[0][0][1])
-    # num_unique = torch.unique(train_dataset[0][0][1])
-    # print(num_unique)
-    # print("--------")
-    # print(train_dataset[0][0][0])
-    # num_unique_1 = torch.unique(train_dataset[0][0][0])
-    # print(num_unique_1)
-    # print("---------")
+    class_counts = calculate_class_counts(train_dataset)
 
-    # class_counts = calculate_class_counts(train_dataset, num_classes=opt.n_classes)
-    # print('Class counts in training dataset:', class_counts)
-    return train_loader, test_loader, train_classifier_loader
+    return train_loader, test_loader, train_classifier_loader, class_counts
 
 
-def set_model(opt):
+def set_model(opt, class_counts):
     torch.cuda.empty_cache()
     
     model = CCTRetNet(
@@ -285,15 +276,19 @@ def set_model(opt):
         n_heads=opt.n_heads
     )
 
-    criterion_model = PaCoLoss(alpha=opt.alpha)
+    criterion_model = BPaCoLoss(alpha=opt.alpha)
+    criterion_model_with_cls_num_list = BPaCoLoss(alpha=opt.alpha, cls_num_list1=class_counts)
 
-    classifier = LinearClassifier(num_classes=opt.n_classes, feat_dim=opt.embedding_dim)
-    criterion_classifier = torch.nn.CrossEntropyLoss()
+
+    # classifier = LinearClassifier(num_classes=opt.n_classes, feat_dim=opt.embedding_dim)
+    criterion_ce = torch.nn.CrossEntropyLoss()
 
     model = model.to(opt.device)
     criterion_model = criterion_model.to(opt.device)
-    classifier = classifier.to(opt.device)
-    criterion_classifier = criterion_classifier.to(opt.device)
+    criterion_model_with_cls_num_list = criterion_model_with_cls_num_list.to(opt.device)
+    # classifier = classifier.to(opt.device)
+    criterion_ce = criterion_ce.to(opt.device)
+
     print('Model device: ', next(model.parameters()).device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -302,14 +297,14 @@ def set_model(opt):
     # print information about the model
     print('Model information (CCTRetNet): ', model)
     print('Criterion for model (GPaCoLoss): ', criterion_model)
-    print('Classifier information (LinearClassifier): ', classifier)
-    print('Criterion for classifier (CrossEntropyLoss): ', criterion_classifier)
+    # print('Classifier information (LinearClassifier): ', classifier)
+    print('Criterion for classifier (CrossEntropyLoss): ', criterion_ce)
 
     print('Model device: ', next(model.parameters()).device)
     print(f'Total parameters: {total_params:,}')
     print(f'Trainable parameters: {trainable_params:,}')
 
-    return model, criterion_model, classifier, criterion_classifier
+    return model, criterion_model, criterion_model_with_cls_num_list, criterion_ce
 
 optimize_dict = {
     'SGD' : optim.SGD,
@@ -340,7 +335,7 @@ def set_optimizer(opt, model, class_str='', optim_choice='SGD'):
 
     return optimizer
 
-def train(train_loader, model, criterion, optimizer, epoch, opt, step):
+def train(train_loader, model, criterion_bpaco_with_no_cls, criterion_bpaco_with_cls, criterion_ce, optimizer, epoch, opt, step):
     """one epoch training"""
     model.train()
 
@@ -363,25 +358,25 @@ def train(train_loader, model, criterion, optimizer, epoch, opt, step):
 
         # here, model is CCTRetNet
         # compute output features for both views
-        output_image_1_before_proj, output_image_1_after_proj = model(images[0]) # (128, 64)
-        output_image_2_before_proj, output_image_2_after_proj = model(images[1]) # (128, 64)
+        output_image_1_after_proj = model(images[0]) # (128, 64)
+        output_image_2_after_proj = model(images[1]) # (128, 64)
 
         outputs = torch.cat((output_image_1_after_proj, output_image_2_after_proj), dim=0)
 
         # compute logits for GPaCo loss
-        logit_1 = model.fc(output_image_1_before_proj) # (128, 10)
-        logit_2 = model.fc(output_image_2_before_proj) # (128, 10)
+        logit_1 = model.fc(model.get_features_before_fc(images[0])) # (128, 128) -> (128, 10)
+        logit_2 = model.fc(model.get_features_before_fc(images[1])) # (128, 128) -> (128, 10)
         logits = torch.cat((logit_1, logit_2), dim=0) # (256, 10)
 
         # concat labels for both views
         labels = torch.cat((labels, labels), dim=0) # (256)
 
-        # print('Output features shape: ', outputs.shape)
-        # print('Logits shape: ', logits.shape)
-        # print('Labels shape: ', labels.shape)
+        bcl_features = torch.cat((output_image_1_after_proj.unsqueeze(1), output_image_2_after_proj.unsqueeze(1)), dim=1)
+        center_logits = F.normalize(model.head_fc(model.fc.weight), dim=1)
 
-        # outputs = outputs.unsqueeze(1) # tạo thêm 1 chiều cho n_views, ở đây n_views = 1, nên shape sẽ là (bsz, 1, projection_dim)
-        loss = criterion(outputs, labels, logits)
+        ce_loss = criterion_ce(logits, labels)
+        bpaco_loss = criterion_bpaco_with_cls(outputs, labels, logits, center_logits)
+        loss = ce_loss + 0.25 * bpaco_loss
         
         losses.update(loss.item(), bsz)
   
@@ -446,7 +441,7 @@ def get_predict(outputs):
     pred = pred.t().cpu().numpy().squeeze(0)
     return pred
 
-def validate(val_loader, model, classifier, criterion, opt):
+def validate(val_loader, model, criterion, opt):
     model.eval()
     # classifier.eval()
     
@@ -458,7 +453,7 @@ def validate(val_loader, model, classifier, criterion, opt):
         for images, labels in tqdm(val_loader): 
             images = images.to(opt.device, non_blocking=True)
             labels = labels.to(opt.device, non_blocking=True)
-            output_feature_before_proj, _ = model(images)
+            output_feature_before_proj = model.get_features_before_fc(images) # (128, 128)
             outputs = model.fc(output_feature_before_proj)
             bsz = labels.size(0)
             loss = criterion(outputs, labels)
@@ -517,12 +512,12 @@ def main():
     torch.cuda.manual_seed_all(seed)
 
     # build data loader
-    train_loader, test_loader, train_classifier_loader = set_loader(opt)
-    model, criterion_model, classifier, criterion_classifier = set_model(opt)
+    train_loader, test_loader, train_classifier_loader, class_counts = set_loader(opt)
+    model, criterion_bpaco_with_no_cls_num_list, criterion_bpaco_with_cls_num_list, criterion_ce = set_model(opt, class_counts)
 
     # build optimizer
     optimizer = set_optimizer(opt, model, optim_choice=opt.optimizer)
-    classifier_optimizer = set_optimizer(opt, classifier, optim_choice=opt.classifier_optimizer)
+    # classifier_optimizer = set_optimizer(opt, classifier, optim_choice=opt.classifier_optimizer)
     
     logger = SummaryWriter(log_dir=opt.tb_folder, flush_secs=2)
 
@@ -545,7 +540,7 @@ def main():
     train_supcon_losses = []
     val_losses = []
 
-    # criterion_model.cal_weight_for_classes(class_counts)
+    criterion_bpaco_with_no_cls_num_list.cal_weight_for_classes(class_counts)
 
     for epoch in range(start_epoch, opt.epochs + 1):
         print('Begin time: ' + str(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())))
@@ -553,7 +548,7 @@ def main():
         adjust_learning_rate(opt, optimizer, epoch)
 
         # train model with supcon loss
-        new_step, train_loss = train(train_loader, model, criterion_model, optimizer, epoch, opt, step)
+        new_step, train_loss = train(train_loader, model, criterion_bpaco_with_no_cls_num_list, criterion_bpaco_with_cls_num_list, criterion_ce, optimizer, epoch, opt, step)
 
         print(f'Epoch {epoch}, CCT-RetNet-GPaCo Loss {train_loss:.4f}')
         log_writer.write(f'Epoch: {epoch}, CCT-RetNet-GPaCo Loss: {train_loss:.4f}\n')
@@ -572,7 +567,7 @@ def main():
         #     logger.add_scalar('classifier_loss/val', classifier_loss, step)
         #     logger.add_scalar('classifier_acc/val', classifier_acc, step)
 
-        loss, val_f1, macro_f1, precision, recall, conf_matrix, accuracy = validate(test_loader, model, classifier, criterion_classifier, opt)
+        loss, val_f1, macro_f1, precision, recall, conf_matrix, accuracy = validate(test_loader, model, criterion_ce, opt)
         logger.add_scalar('loss_ce/val', loss, step)
         logger.add_scalar('acc/val', accuracy, step)
         logger.add_scalar('val_f1/val', val_f1, step)

@@ -106,7 +106,7 @@ class TransformerClassifier(nn.Module):
                  n_layers=2, # 2
                  n_heads=2, # 2
                  mlp_ratio=4.0, # 1
-                 num_classes=10,
+                 num_classes=64,
                  dropout_rate=0.1,
                  attention_dropout=0.1,
                  stochastic_depth_rate=0.1,
@@ -158,10 +158,10 @@ class TransformerClassifier(nn.Module):
 
         self.norm = nn.LayerNorm(embedding_dim)
 
-        self.fc = nn.Linear(embedding_dim, num_classes)
+        self.fc = nn.Linear(embedding_dim, num_classes) # num_classes ~ projection_dim
         self.apply(self.init_weight)
 
-    def forward(self, x): # when call Transformer Classifier, put x is a sequence of tokens
+    def get_feature_before_fc(self, x): # when call Transformer Classifier, put x is a sequence of tokens
         # print("Investigating the input x of Transformer Classifier: ", x.shape) # expectedshape is (batch_size, sequence_length, embedding_dim)
         b = x.shape[0]
 
@@ -185,7 +185,14 @@ class TransformerClassifier(nn.Module):
         else:
             x = x[:, -1] # get the last token, shape is (batch_size, embedding_dim)
 
-        return x # shape is (128, 256)
+        # print("Print shape of feature before fc: ", x.shape)
+
+        return x # shape is (128, 128) ~ (batch_size, embedding_dim)
+
+    def forward(self, x):
+        x = self.get_feature_before_fc(x) # (128, 128)
+        x = self.fc(x) # (128, 128) -> (128, 64)
+        return x # chưa l2-normalize, x has shape (128, num_classes), ở đây num_classes=projection_dim=64
 
     @staticmethod
     def init_weight(m):
@@ -219,6 +226,7 @@ class CCTRetNet(nn.Module):
         projection_dim=64,
         n_layers=2,
         n_heads=2,
+        num_classes=10,
         *args, **kwargs
     ):
         super().__init__()
@@ -241,22 +249,27 @@ class CCTRetNet(nn.Module):
             sequence_length=self.tokenizer.sequence_length(n_channels=n_input_channels, # number of channels in the input image (3)
                                                            height=img_height,
                                                            width=img_width),
-            embedding_dim=embedding_dim, # 256
+            embedding_dim=embedding_dim, # 128
             seq_pool=True,
             dropout_rate=dropout_rate,
             attention_dropout=attention_dropout,
             stochastic_depth_rate=stochastic_depth_rate,
             n_layers=2,
             n_heads=2,
+            num_classes=projection_dim,
             *args, **kwargs)
     
-        self.fc = nn.Linear(embedding_dim, 10) # for supervised loss, shape is (128, 10)
+        self.fc = nn.Linear(embedding_dim, num_classes) # for supervised loss, shape is (128, 10)
+        self.head_fc = nn.Sequential(nn.Linear(embedding_dim, embedding_dim), nn.BatchNorm1d(embedding_dim), nn.ReLU(inplace=True),
+                                   nn.Linear(embedding_dim, projection_dim))
         
-        # add projection head 
+        # add projection head, projection_dim: feature dimension used for contrastive learning
         if projection_head == 'linear':
             self.head = nn.Linear(embedding_dim, projection_dim)
         elif projection_head == 'mlp':
             self.head = nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(inplace=True),
                 nn.Linear(embedding_dim, embedding_dim),
                 nn.ReLU(inplace=True),
                 nn.Linear(embedding_dim, projection_dim)
@@ -267,17 +280,20 @@ class CCTRetNet(nn.Module):
     
     def encode(self, x): # (128, 3, 64, 64)
         x = self.tokenizer(x)
-        return self.encoder(x) # (128, 128)
+        return self.encoder(x) # (128, 64), chưa l2-normalize
+    
+    def get_features_before_fc(self, x):
+        x = self.tokenizer(x)
+        return self.encoder.get_feature_before_fc(x) # (128, 128)
     
     def projection(self, features): # (128, 128)
         return self.head(features) # (128, 64)
 
     def forward(self, x): # (128, 3, 64, 64)
+        
+        x = self.encode(x)
 
-        x_before_projection = self.encode(x)
-        x_after_projection = self.head(x_before_projection) # (128, 64)
-
-        return x_before_projection, F.normalize(x_after_projection, dim=1) # shape is (128, 64), L2-normalized
+        return F.normalize(x, dim=1) # shape is (128, 64), L2-normalized
     
 class CCTRetNetNoProjectionHead(nn.Module):
     def __init__(

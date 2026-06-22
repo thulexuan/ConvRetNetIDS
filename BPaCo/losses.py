@@ -260,7 +260,7 @@ class BalSCL(nn.Module):
 
 
 class BPaCoLoss(nn.Module):
-    def __init__(self, alpha, beta=1.0, gamma=1.0, supt=1.0, temperature=1.0, base_temperature=None, K=8192, num_classes=1000, smooth=0.0, cls_num_list1=None):
+    def __init__(self, alpha, beta=1.0, gamma=1.0, supt=1.0, temperature=1.0, base_temperature=None, K=8192, num_classes=10, smooth=0.0, cls_num_list1=None):
         super(BPaCoLoss, self).__init__()
         self.temperature = temperature
         self.beta = beta
@@ -285,7 +285,8 @@ class BPaCoLoss(nn.Module):
         device = (torch.device('cuda')
                   if features.is_cuda
                   else torch.device('cpu'))
-        batch_size = features.shape[0] - self.K
+        # batch_size = features.shape[0] - self.K
+        batch_size = features.shape[0]
         labels = labels.contiguous().view(-1, 1)
         labels_centers = torch.arange(len(self.cls_num_list1), device=device).view(-1, 1)
         labels1 = torch.cat([labels[:batch_size], labels_centers], dim=0)
