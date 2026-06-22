@@ -154,7 +154,7 @@ def parse_option():
                     help='the number of RetNet retention layers in each block')
 
     # loss configuration
-    parser.add_argument('--alpha', default=0.05, type=float,
+    parser.add_argument('--alpha', default=1.00, type=float,
                     help='contrast weight among samples')
     
 
