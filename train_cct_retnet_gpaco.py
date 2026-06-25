@@ -131,7 +131,7 @@ def parse_option():
                         help='number of class')
 
     # method
-    parser.add_argument('--method', type=str, default='BaseLine', 
+    parser.add_argument('--method', type=str, default='GPaCo', 
                         help='choose method')
 
     # other setting
@@ -154,10 +154,17 @@ def parse_option():
                     help='the number of RetNet blocks')
     parser.add_argument('--n_heads', default=2, type=int,
                     help='the number of RetNet retention layers in each block')
+    parser.add_argument('--n_conv_layers', default=2, type=int,
+                    help='the number of convolutional layers in tokenizer')
+    parser.add_argument('--positional_embedding', type=str, default='learnable',
+                        choices=['sine', 'learnable', 'none'],
+                        help='type of positional embedding')
 
     # loss configuration
     parser.add_argument('--alpha', default=0.05, type=float,
                     help='contrast weight among samples')
+    parser.add_argument('--temp', default=0.07, type=float,
+                    help='temperature for contrastive learning')
     
 
     opt = parser.parse_args()
@@ -249,6 +256,7 @@ def set_loader(opt):
     #     sci_mode=False   
     # )
     class_counts = calculate_class_counts(train_dataset)
+    print("Print class counts here: ", class_counts)
 
     return train_loader, test_loader, train_classifier_loader, class_counts
 
@@ -270,23 +278,18 @@ def set_model(opt, class_counts):
         # num_heads = 4, # the number of attention heads in each transformer encoder layer
         mlp_ratio = 2.5, # dim feedforward layer = embedding_dim * mlp_ratio, current case = 128 * 2.5 = 320
         num_classes = opt.n_classes,
-        positional_embedding = 'learnable', # ['sine', 'learnable', 'none']
+        positional_embedding = opt.positional_embedding, # ['sine', 'learnable', 'none']
         projection_dim=opt.projection_dim,
         n_layers=opt.n_layers,
         n_heads=opt.n_heads
     )
 
-    criterion_model = BPaCoLoss(alpha=opt.alpha)
-    criterion_model_with_cls_num_list = BPaCoLoss(alpha=opt.alpha, cls_num_list1=class_counts)
+    criterion_model = PaCoLoss(alpha=opt.alpha, temperature=opt.temp)
 
-
-    # classifier = LinearClassifier(num_classes=opt.n_classes, feat_dim=opt.embedding_dim)
     criterion_ce = torch.nn.CrossEntropyLoss()
 
     model = model.to(opt.device)
     criterion_model = criterion_model.to(opt.device)
-    criterion_model_with_cls_num_list = criterion_model_with_cls_num_list.to(opt.device)
-    # classifier = classifier.to(opt.device)
     criterion_ce = criterion_ce.to(opt.device)
 
     print('Model device: ', next(model.parameters()).device)
@@ -297,14 +300,13 @@ def set_model(opt, class_counts):
     # print information about the model
     print('Model information (CCTRetNet): ', model)
     print('Criterion for model (GPaCoLoss): ', criterion_model)
-    # print('Classifier information (LinearClassifier): ', classifier)
     print('Criterion for classifier (CrossEntropyLoss): ', criterion_ce)
 
     print('Model device: ', next(model.parameters()).device)
     print(f'Total parameters: {total_params:,}')
     print(f'Trainable parameters: {trainable_params:,}')
 
-    return model, criterion_model, criterion_model_with_cls_num_list, criterion_ce
+    return model, criterion_model, criterion_ce
 
 optimize_dict = {
     'SGD' : optim.SGD,
@@ -335,7 +337,7 @@ def set_optimizer(opt, model, class_str='', optim_choice='SGD'):
 
     return optimizer
 
-def train(train_loader, model, criterion_bpaco_with_no_cls, criterion_bpaco_with_cls, criterion_ce, optimizer, epoch, opt, step):
+def train(train_loader, model, criterion_gpaco, criterion_ce, optimizer, epoch, opt, step):
     """one epoch training"""
     model.train()
 
@@ -358,25 +360,20 @@ def train(train_loader, model, criterion_bpaco_with_no_cls, criterion_bpaco_with
 
         # here, model is CCTRetNet
         # compute output features for both views
-        output_image_1_after_proj = model(images[0]) # (128, 64)
-        output_image_2_after_proj = model(images[1]) # (128, 64)
+        output_image_1_before_proj, output_image_1_after_proj = model(images[0]) # (128, 128), (128, 64)
+        output_image_2_before_proj, output_image_2_after_proj = model(images[1]) # (128, 128), (128, 64)
 
-        outputs = torch.cat((output_image_1_after_proj, output_image_2_after_proj), dim=0)
+        outputs = torch.cat((output_image_1_after_proj, output_image_2_after_proj), dim=0) # (256, 64)
 
         # compute logits for GPaCo loss
-        logit_1 = model.fc(model.get_features_before_fc(images[0])) # (128, 128) -> (128, 10)
-        logit_2 = model.fc(model.get_features_before_fc(images[1])) # (128, 128) -> (128, 10)
+        logit_1 = model.fc(output_image_1_before_proj) # (128, 128) -> (128, 10)
+        logit_2 = model.fc(output_image_2_before_proj) # (128, 128) -> (128, 10)
         logits = torch.cat((logit_1, logit_2), dim=0) # (256, 10)
 
         # concat labels for both views
         labels = torch.cat((labels, labels), dim=0) # (256)
 
-        bcl_features = torch.cat((output_image_1_after_proj.unsqueeze(1), output_image_2_after_proj.unsqueeze(1)), dim=1)
-        center_logits = F.normalize(model.head_fc(model.fc.weight), dim=1)
-
-        ce_loss = criterion_ce(logits, labels)
-        bpaco_loss = criterion_bpaco_with_cls(outputs, labels, logits, center_logits)
-        loss = ce_loss + 0.25 * bpaco_loss
+        loss = criterion_gpaco(outputs, labels, logits)
         
         losses.update(loss.item(), bsz)
   
@@ -453,8 +450,8 @@ def validate(val_loader, model, criterion, opt):
         for images, labels in tqdm(val_loader): 
             images = images.to(opt.device, non_blocking=True)
             labels = labels.to(opt.device, non_blocking=True)
-            output_feature_before_proj = model.get_features_before_fc(images) # (128, 128)
-            outputs = model.fc(output_feature_before_proj)
+            output_feature_before_proj, _ = model(images) # (128, 128)
+            outputs = model.fc(output_feature_before_proj) # (128, 128) -> (128, 10)
             bsz = labels.size(0)
             loss = criterion(outputs, labels)
             losses.update(loss.item(), bsz)
@@ -513,7 +510,7 @@ def main():
 
     # build data loader
     train_loader, test_loader, train_classifier_loader, class_counts = set_loader(opt)
-    model, criterion_bpaco_with_no_cls_num_list, criterion_bpaco_with_cls_num_list, criterion_ce = set_model(opt, class_counts)
+    model, criterion_gpaco, criterion_ce = set_model(opt, class_counts)
 
     # build optimizer
     optimizer = set_optimizer(opt, model, optim_choice=opt.optimizer)
@@ -540,7 +537,7 @@ def main():
     train_supcon_losses = []
     val_losses = []
 
-    criterion_bpaco_with_no_cls_num_list.cal_weight_for_classes(class_counts)
+    # criterion_gpaco.cal_weight_for_classes(class_counts)
 
     for epoch in range(start_epoch, opt.epochs + 1):
         print('Begin time: ' + str(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())))
@@ -548,7 +545,7 @@ def main():
         adjust_learning_rate(opt, optimizer, epoch)
 
         # train model with supcon loss
-        new_step, train_loss = train(train_loader, model, criterion_bpaco_with_no_cls_num_list, criterion_bpaco_with_cls_num_list, criterion_ce, optimizer, epoch, opt, step)
+        new_step, train_loss = train(train_loader, model, criterion_gpaco, criterion_ce, optimizer, epoch, opt, step)
 
         print(f'Epoch {epoch}, CCT-RetNet-GPaCo Loss {train_loss:.4f}')
         log_writer.write(f'Epoch: {epoch}, CCT-RetNet-GPaCo Loss: {train_loss:.4f}\n')

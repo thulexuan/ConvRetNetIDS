@@ -15,14 +15,21 @@ class TFwriter:
         self._start_idx = start_idx
         
     def serialize_example(self, x, y):
-        """Converts one window_size x 65 feature matrix and label to TFRecord."""
-        feature = tf.train.FloatList(value=np.array(x, dtype=np.float32).flatten().tolist())
+        """Converts x (which will now be 32x32x3), y to tf.train.Example and serializes"""
+        id_seq, data_seq, timestamp = x
+
+        # Flatten the 32x32 matrices into a single array before saving, and ensure int64
+        id_seq = tf.train.Int64List(value=np.array(id_seq).flatten().tolist())
+        data_seq = tf.train.Int64List(value=np.array(data_seq).flatten().tolist())
+        timestamp = tf.train.FloatList(value=np.array(timestamp).flatten().tolist())
 
         label = tf.train.Int64List(value=[int(y)])
 
         features = tf.train.Features(
             feature={
-                "feature": tf.train.Feature(float_list=feature),
+                "id_seq": tf.train.Feature(int64_list=id_seq),
+                "data_seq": tf.train.Feature(int64_list=data_seq),
+                "timestamp": tf.train.Feature(float_list=timestamp),
                 "label": tf.train.Feature(int64_list=label)
             }
         )
@@ -32,7 +39,7 @@ class TFwriter:
     def write(self, data, label):
         filename = os.path.join(self._outdir, str(self._start_idx)+'.tfrec')
         with tf.io.TFRecordWriter(filename) as outfile:
-            outfile.write(self.serialize_example(data, label))
+            outfile.write(self.serialize_example(data, label[0]))
         self._start_idx += 1
 
         
@@ -62,21 +69,33 @@ class TFwriter:
 def read_tfrecord(example, window_size):
     """Parses a TFRecord into the expected features."""
     feature_description = {
-        'feature': tf.io.FixedLenFeature([window_size, 65], tf.float32),
+        'id_seq': tf.io.FixedLenFeature([window_size, window_size], tf.int64),
+        'data_seq': tf.io.FixedLenFeature([window_size, window_size], tf.int64),
+        'timestamp': tf.io.FixedLenFeature([window_size, window_size], tf.float32),
         'label': tf.io.FixedLenFeature([1], tf.int64)
     }
     parsed_example = tf.io.parse_single_example(example, feature_description)
 
-    return {'feature': parsed_example['feature']}, parsed_example['label']
-
+    # Convert the parsed features into a dictionary for easy access
+    features = {
+        'id_seq': parsed_example['id_seq'],
+        'data_seq': parsed_example['data_seq'],
+        'timestamp': parsed_example['timestamp']
+    }
+    
+    # Return the input features and the label
+    return features, parsed_example['label']
 
 def write_tfrecord(dataset, tfwriter):
     for batch_data in iter(dataset):
-        features = batch_data[0]['feature']
-        labels = batch_data[1]
+        # Access the features from batch_data[0]
+        features = zip(batch_data[0]['id_seq'], batch_data[0]['data_seq'], batch_data[0]['timestamp'])
+        
+        # Access the labels directly from batch_data[1]
+        labels = batch_data[1]  # Assuming labels are directly available in batch_data[1]
         
         for x, y in zip(features, labels):
-            tfwriter.write(x, y)
+            tfwriter.write(x, y)  # Write the feature and label pair
             
 def train_test_split(**args):
     """
@@ -89,19 +108,27 @@ def train_test_split(**args):
     out_dir = data_dir + '/{}'.format(args['rid'])
     train_dir = os.path.join(out_dir, 'train')
     val_dir = os.path.join(out_dir, 'val')
+    test_dir = os.path.join(out_dir, 'test')
     if not os.path.exists(train_dir):
         os.makedirs(train_dir)
     if not os.path.exists(val_dir):
         os.makedirs(val_dir)
+    if not os.path.exists(test_dir):
+        os.makedirs(test_dir)
+
     data_info = json.load(open(data_dir + '/datainfo.txt'))
     train_writer = TFwriter(train_dir)
     val_writer = TFwriter(val_dir)
+    test_writer = TFwriter(test_dir)
     
     train_ratio = 0.7
+    val_ratio = 0.15
+    test_ratio = 0.15
     batch_size = 1000
 
     total_train_size = 0
     total_val_size = 0
+    total_test_size = 0
 
     for filename, dataset_size in data_info.items():
         print('Read from {}: {} records'.format(filename, dataset_size))
@@ -111,29 +138,37 @@ def train_test_split(**args):
         dataset = dataset.shuffle(50000)
 
         train_size = int(dataset_size * train_ratio)
-        val_size = (dataset_size - train_size)
+        val_size = int(dataset_size * val_ratio)
+        test_size = dataset_size - train_size - val_size
         
         train_dataset = dataset.take(train_size)
-        val_dataset = dataset.skip(train_size)
+
+        remaining_dataset = dataset.skip(train_size)
+        val_dataset = remaining_dataset.take(val_size)
+        test_dataset = remaining_dataset.skip(val_size)
         
         train_dataset = train_dataset.batch(batch_size)
         val_dataset = val_dataset.batch(batch_size)
+        test_dataset = test_dataset.batch(batch_size)
             
         write_tfrecord(train_dataset, train_writer)
         write_tfrecord(val_dataset, val_writer)
+        write_tfrecord(test_dataset, test_writer)
         
         total_train_size += train_size
         total_val_size += val_size
+        total_test_size += test_size
         
     print('Total training: ', total_train_size)
     print('Total validation: ', total_val_size)
+    print('Total test size: ', total_test_size)
      
 if __name__ == '__main__':
     # Parse argument
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', type=str, default='./data/can-ml/can-ml/2017-subaru-forester/220626/preprocessed/payload_only')
-    parser.add_argument('--window_size', type=int)
-    parser.add_argument('--strided', type=int) 
+    parser.add_argument('--data_path', type=str, default='./data/can-ml/can-ml/2017-subaru-forester/220626-frac=0.1')
+    parser.add_argument('--window_size', type=int, default=64)
+    parser.add_argument('--strided', type=int, default=32) 
     parser.add_argument('--rid', type=int, default=1)
     
     args = vars(parser.parse_args())

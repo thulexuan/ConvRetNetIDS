@@ -24,12 +24,28 @@ __all__ = ['cct_2', 'cct_4', 'cct_6', 'cct_7', 'cct_8', 'cct_14', 'cct_16']
 
 # positional
 
-def sinusoidal_embedding(n_channels, dim):
+def sinusoidal_embedding(n_channels, dim): # 1D positional embedding, cho biết token index chứ k cho biết token nằm ở hàng nào, cột nào
     pe = torch.FloatTensor([[p / (10000 ** (2 * (i // 2) / dim)) for i in range(dim)]
                             for p in range(n_channels)])
     pe[:, 0::2] = torch.sin(pe[:, 0::2])
     pe[:, 1::2] = torch.cos(pe[:, 1::2])
     return rearrange(pe, '... -> 1 ...')
+
+def sinusoidal_embedding_2d(height, width, dim):
+    if dim <= 1:
+        return sinusoidal_embedding(height * width, dim)
+
+    row_dim = dim // 2
+    col_dim = dim - row_dim
+
+    row_pe = sinusoidal_embedding(height, row_dim).squeeze(0)
+    col_pe = sinusoidal_embedding(width, col_dim).squeeze(0)
+
+    row_pe = repeat(row_pe, 'h d -> h w d', w=width)
+    col_pe = repeat(col_pe, 'w d -> h w d', h=height)
+
+    pe = torch.cat([row_pe, col_pe], dim=-1)
+    return rearrange(pe, 'h w d -> 1 (h w) d')
 
 # modules
 
@@ -110,8 +126,9 @@ class TransformerClassifier(nn.Module):
                  dropout_rate=0.1,
                  attention_dropout=0.1,
                  stochastic_depth_rate=0.1,
-                 positional_embedding='sine',
+                 positional_embedding='learnable',
                  sequence_length=None,
+                 mlp=True,
                  *args, **kwargs):
         super().__init__()
         assert positional_embedding in {'sine', 'learnable', 'none'}
@@ -158,7 +175,17 @@ class TransformerClassifier(nn.Module):
 
         self.norm = nn.LayerNorm(embedding_dim)
 
-        self.fc = nn.Linear(embedding_dim, num_classes) # num_classes ~ projection_dim
+        if mlp: 
+            self.fc = nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(embedding_dim, num_classes)
+            )
+        else:
+            self.fc = nn.Linear(embedding_dim, num_classes) # num_classes ~ projection_dim
+        
         self.apply(self.init_weight)
 
     def get_feature_before_fc(self, x): # when call Transformer Classifier, put x is a sequence of tokens
@@ -190,9 +217,9 @@ class TransformerClassifier(nn.Module):
         return x # shape is (128, 128) ~ (batch_size, embedding_dim)
 
     def forward(self, x):
-        x = self.get_feature_before_fc(x) # (128, 128)
-        x = self.fc(x) # (128, 128) -> (128, 64)
-        return x # chưa l2-normalize, x has shape (128, num_classes), ở đây num_classes=projection_dim=64
+        x_before_fc = self.get_feature_before_fc(x) # (128, 128)
+        x_after_fc = self.fc(x_before_fc) # (128, 128) -> (128, 64)
+        return x_before_fc, x_after_fc # chưa l2-normalize, x has shape (128, num_classes), ở đây num_classes=projection_dim=64
 
     @staticmethod
     def init_weight(m):
@@ -227,6 +254,7 @@ class CCTRetNet(nn.Module):
         n_layers=2,
         n_heads=2,
         num_classes=10,
+        positional_embedding='learnable',
         *args, **kwargs
     ):
         super().__init__()
@@ -257,6 +285,7 @@ class CCTRetNet(nn.Module):
             n_layers=2,
             n_heads=2,
             num_classes=projection_dim,
+            positional_embedding=positional_embedding,
             *args, **kwargs)
     
         self.fc = nn.Linear(embedding_dim, num_classes) # for supervised loss, shape is (128, 10)
@@ -278,74 +307,66 @@ class CCTRetNet(nn.Module):
             raise NotImplementedError(
                 'head not supported: {}'.format(projection_head))
     
-    def encode(self, x): # (128, 3, 64, 64)
-        x = self.tokenizer(x)
-        return self.encoder(x) # (128, 64), chưa l2-normalize
-    
-    def get_features_before_fc(self, x):
-        x = self.tokenizer(x)
-        return self.encoder.get_feature_before_fc(x) # (128, 128)
-    
-    def projection(self, features): # (128, 128)
-        return self.head(features) # (128, 64)
-
     def forward(self, x): # (128, 3, 64, 64)
         
-        x = self.encode(x)
-
-        return F.normalize(x, dim=1) # shape is (128, 64), L2-normalized
-    
-class CCTRetNetNoProjectionHead(nn.Module):
-    def __init__(
-        self,
-        img_size=64,
-        embedding_dim=256, # dimension of each token after tokenization = the number of filters in convolutional layers
-        n_input_channels=3,
-        n_conv_layers=2,
-        kernel_size=3,
-        stride=1,
-        padding=1,
-        pooling_kernel_size=2,
-        pooling_stride=2,
-        pooling_padding=0,
-        dropout_rate=0.,
-        attention_dropout=0.1,
-        stochastic_depth_rate=0.1,
-        *args, **kwargs
-    ):
-        super().__init__()
-        img_height, img_width = pair(img_size)
-
-        self.tokenizer = Tokenizer(n_input_channels=n_input_channels,  # number of channels in the input image. after implementing convolution, image from [3, 64, 64] -> [embedding_dim, 64, 64]
-                                   n_output_channels=embedding_dim, # the number of filters
-                                   kernel_size=kernel_size,  # kernel size for convolutional layers
-                                   stride=stride,
-                                   padding=padding,
-                                   pooling_kernel_size=pooling_kernel_size,
-                                   pooling_stride=pooling_stride,
-                                   pooling_padding=pooling_padding,
-                                   max_pool=True,
-                                   activation=nn.ReLU,
-                                   n_conv_layers=n_conv_layers, # number of comvolutional layers
-                                   conv_bias=False)
-
-        self.classifier = TransformerClassifier(
-            sequence_length=self.tokenizer.sequence_length(n_channels=n_input_channels, # number of channels in the input image (3)
-                                                           height=img_height,
-                                                           width=img_width),
-            embedding_dim=embedding_dim, # 256
-            seq_pool=True,
-            dropout_rate=dropout_rate,
-            attention_dropout=attention_dropout,
-            stochastic_depth_rate=stochastic_depth_rate,
-            *args, **kwargs)
-    
-    def encode(self, x): # (128, 3, 64, 64)
         x = self.tokenizer(x)
-        return self.classifier.get_features(x) # (128, 256)
+        x_before_fc, x_after_fc = self.encoder(x) # x_before_fc (128, 128), x_after_fc (128, 64)
+        # print("check")
+        # print(x_before_fc.shape, x_after_fc.shape)
 
-    def forward(self, x): # (128, 3, 64, 64)
+        return x_before_fc, F.normalize(x_after_fc, dim=1) # x_after_fc shape is (128, 64), L2-normalized
+    
+# class CCTRetNetNoProjectionHead(nn.Module):
+#     def __init__(
+#         self,
+#         img_size=64,
+#         embedding_dim=256, # dimension of each token after tokenization = the number of filters in convolutional layers
+#         n_input_channels=3,
+#         n_conv_layers=2,
+#         kernel_size=3,
+#         stride=1,
+#         padding=1,
+#         pooling_kernel_size=2,
+#         pooling_stride=2,
+#         pooling_padding=0,
+#         dropout_rate=0.,
+#         attention_dropout=0.1,
+#         stochastic_depth_rate=0.1,
+#         *args, **kwargs
+#     ):
+#         super().__init__()
+#         img_height, img_width = pair(img_size)
 
-        x = self.tokenizer(x)
+#         self.tokenizer = Tokenizer(n_input_channels=n_input_channels,  # number of channels in the input image. after implementing convolution, image from [3, 64, 64] -> [embedding_dim, 64, 64]
+#                                    n_output_channels=embedding_dim, # the number of filters
+#                                    kernel_size=kernel_size,  # kernel size for convolutional layers
+#                                    stride=stride,
+#                                    padding=padding,
+#                                    pooling_kernel_size=pooling_kernel_size,
+#                                    pooling_stride=pooling_stride,
+#                                    pooling_padding=pooling_padding,
+#                                    max_pool=True,
+#                                    activation=nn.ReLU,
+#                                    n_conv_layers=n_conv_layers, # number of comvolutional layers
+#                                    conv_bias=False)
 
-        return self.classifier(x) # shape is (128, 10)
+#         self.classifier = TransformerClassifier(
+#             sequence_length=self.tokenizer.sequence_length(n_channels=n_input_channels, # number of channels in the input image (3)
+#                                                            height=img_height,
+#                                                            width=img_width),
+#             embedding_dim=embedding_dim, # 256
+#             seq_pool=True,
+#             dropout_rate=dropout_rate,
+#             attention_dropout=attention_dropout,
+#             stochastic_depth_rate=stochastic_depth_rate,
+#             *args, **kwargs)
+    
+#     def encode(self, x): # (128, 3, 64, 64)
+#         x = self.tokenizer(x)
+#         return self.classifier.get_features(x) # (128, 256)
+
+#     def forward(self, x): # (128, 3, 64, 64)
+
+#         x = self.tokenizer(x)
+
+#         return self.classifier(x) # shape is (128, 10)

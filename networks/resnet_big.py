@@ -205,8 +205,8 @@ class LinearClassifier(nn.Module):
         # _, feat_dim = model_dict[name]
         self.fc = nn.Linear(feat_dim, num_classes)
 
-    def forward(self, features): # (128, 1, 256)
-        return self.fc(features)
+    def forward(self, features): # (128, 128)
+        return self.fc(features) # (128, 10)
     
 class ConResNet(nn.Module):
     """backbone + projection head"""

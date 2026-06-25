@@ -35,6 +35,28 @@ def split_into_list(string, type):
     
     return [int(bit) for bit in res]
 
+def transform_timestamp_log_delta(df, timestamp_col="timestamp", scale_factor=1e6):
+    df = df.copy()
+
+    ts = df[timestamp_col].astype(float).values
+
+    # global delta time
+    delta_t = np.diff(ts, prepend=ts[0])
+    delta_t = np.maximum(delta_t, 0.0)
+
+    # log-scaled delta time
+    log_delta = np.log1p(scale_factor * delta_t)
+
+    # min-max scale về [0, 1]
+    log_delta_norm = (log_delta - log_delta.min()) / (
+        log_delta.max() - log_delta.min() + 1e-8
+    )
+
+    # ghi đè lên chính cột timestamp
+    df[timestamp_col] = log_delta_norm.astype(np.float32)
+
+    return df
+
 def parse_and_stack_timestamps(timestamps, target_size=64):
     """
     Parse and stack timestamps into a 2D array where each row is a parsed timestamp.
@@ -126,7 +148,7 @@ def split_data(file_name, attack_id, window_size, strided_size, target_size=64):
 
     print("The number of rows in the original CSV: ", len(df))
 
-    df = df.sort_values('timestamp', ascending=True)
+    df = df.sort_values('timestamp', ascending=True).reset_index(drop=True)
 
     print("data field", df.iloc[0]['data_field'])
 
@@ -137,6 +159,13 @@ def split_data(file_name, attack_id, window_size, strided_size, target_size=64):
 
     # Normalize and stack timestamp
     df['timestamp'] = normalize_time_zscore(df['timestamp'].values)
+    # df = transform_timestamp_log_delta(
+    #     df,
+    #     timestamp_col="timestamp",
+    #     scale_factor=1e6
+    # )
+
+    print(df.head())
 
     print("CAN-ML pre-processing: Done")
 
@@ -198,7 +227,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--indir', type=str, default="./data/can-ml/can-ml/2017-subaru-forester/merged")
-    parser.add_argument('--outdir', type=str, default="./data/can-ml/can-ml/2017-subaru-forester/160626-1/preprocessed/all_features_30/TFRecord")
+    parser.add_argument('--outdir', type=str, default="./data/can-ml/can-ml/2017-subaru-forester/220626/TFRecord")
     parser.add_argument('--window_size', type=int, default=64)
     parser.add_argument('--strided', type=int, default=32)
     args = parser.parse_args()
