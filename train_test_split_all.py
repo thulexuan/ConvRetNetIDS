@@ -15,13 +15,14 @@ class TFwriter:
         self._start_idx = start_idx
         
     def serialize_example(self, x, y):
-        """Converts x (which will now be 32x32x3), y to tf.train.Example and serializes"""
+        """Converts x (which will now be 32x32x4), y to tf.train.Example and serializes"""
         id_seq, data_seq, timestamp = x
 
         # Flatten the 32x32 matrices into a single array before saving, and ensure int64
         id_seq = tf.train.Int64List(value=np.array(id_seq).flatten().tolist())
         data_seq = tf.train.Int64List(value=np.array(data_seq).flatten().tolist())
         timestamp = tf.train.FloatList(value=np.array(timestamp).flatten().tolist())
+        # id_freq = tf.train.FloatList(value=np.array(id_freq).flatten().tolist())
 
         label = tf.train.Int64List(value=[int(y)])
 
@@ -30,6 +31,7 @@ class TFwriter:
                 "id_seq": tf.train.Feature(int64_list=id_seq),
                 "data_seq": tf.train.Feature(int64_list=data_seq),
                 "timestamp": tf.train.Feature(float_list=timestamp),
+                # "id_freq": tf.train.Feature(float_list=id_freq),
                 "label": tf.train.Feature(int64_list=label)
             }
         )
@@ -80,7 +82,7 @@ def read_tfrecord(example, window_size):
     features = {
         'id_seq': parsed_example['id_seq'],
         'data_seq': parsed_example['data_seq'],
-        'timestamp': parsed_example['timestamp']
+        'timestamp': parsed_example['timestamp'],
     }
     
     # Return the input features and the label
@@ -103,6 +105,7 @@ def train_test_split(**args):
     if args['strided'] == None:
         args['strided'] = args['window_size']
 
+    # data_dir = f"{args['data_path']}/merged_rid{args['rid']}TFRecord_w{args['window_size']}_s{args['strided']}"
     data_dir = f"{args['data_path']}/TFRecord_w{args['window_size']}_s{args['strided']}"
         
     out_dir = data_dir + '/{}'.format(args['rid'])
@@ -133,6 +136,7 @@ def train_test_split(**args):
     for filename, dataset_size in data_info.items():
         print('Read from {}: {} records'.format(filename, dataset_size))
         dataset = tf.data.TFRecordDataset(filename)
+        # window_size = 32
         dataset = dataset.map(lambda x: read_tfrecord(x, args['window_size']), 
                                 num_parallel_calls=tf.data.experimental.AUTOTUNE)
         dataset = dataset.shuffle(50000)
@@ -166,7 +170,7 @@ def train_test_split(**args):
 if __name__ == '__main__':
     # Parse argument
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_path', type=str, default='./data/can-ml/can-ml/2017-subaru-forester/220626-frac=0.1')
+    parser.add_argument('--data_path', type=str, default='./data/can-ml/can-ml/2017-subaru-forester/070726')
     parser.add_argument('--window_size', type=int, default=64)
     parser.add_argument('--strided', type=int, default=32) 
     parser.add_argument('--rid', type=int, default=1)

@@ -5,11 +5,11 @@
       "name": "Debug Python file",
       "type": "debugpy",
       "request": "launch",
-      "program": "../train_cct_retnet_gpaco.py",
+      "program": "../train_test_split_all.py",
       "console": "integratedTerminal",
       "args": [
-            "--epochs", "1", 
-            "--batch_size", "128"
+            // "--epochs", "1", 
+            // "--batch_size", "128"
         ]
     }
   ]

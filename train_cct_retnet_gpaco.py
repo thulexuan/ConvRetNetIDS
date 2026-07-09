@@ -15,7 +15,8 @@ import torch.nn.functional as F
 import pprint
 from BPaCo.losses import BPaCoLoss
 from GPaCo.losses import PaCoLoss
-from dataset import CANDatasetEnet as CANDataset
+# from dataset import CANDatasetEnet as CANDataset
+from dataset import CANDatasetEnet, CANDatasetEnetWithNormalizingTs
 # from networks.vision_trans import CEViT
 from datetime import datetime
 from networks.resnet_big import LinearClassifier
@@ -148,6 +149,8 @@ def parse_option():
                         help='dimension of the embedding layer')
     parser.add_argument('--projection_dim', type=int, default=64,
                         help='dimension of the projection layer to train feature space')
+    parser.add_argument('--n_input_channels', default=3, type=int,
+                    help='the number of input channels')
     
     # settings for RetNet config
     parser.add_argument('--n_layers', default=2, type=int,
@@ -157,7 +160,7 @@ def parse_option():
     parser.add_argument('--n_conv_layers', default=2, type=int,
                     help='the number of convolutional layers in tokenizer')
     parser.add_argument('--positional_embedding', type=str, default='learnable',
-                        choices=['sine', 'learnable', 'none'],
+                        choices=['sine', 'learnable', 'none', 'sine_2d', 'learnable_2d'],
                         help='type of positional embedding')
 
     # loss configuration
@@ -241,8 +244,35 @@ def set_loader(opt):
         transforms.Normalize(mean=mean, std=std)
     ])
 
-    train_dataset = CANDataset(root_dir=opt.data_folder, window_size=32, is_train=True, is_test=False, transform=TwoCropTransform(train_transform))
-    test_dataset = CANDataset(root_dir=opt.data_folder, window_size=32, is_train=False, is_test=False, include_data=False, transform=transform)
+    train_dataset = CANDatasetEnet(
+        root_dir=opt.data_folder, window_size=32, is_train=True, is_test=False, transform=TwoCropTransform(train_transform), 
+        # normalize_timestamp=True,
+        # fit_timestamp_scaler=True
+        )
+    
+    test_dataset = CANDatasetEnet(
+        root_dir=opt.data_folder, window_size=32, is_train=False, is_test=False, include_data=False, transform=transform,
+        # normalize_timestamp=True,
+        # fit_timestamp_scaler=False,
+        # timestamp_log_min=timestamp_log_min,
+        # timestamp_log_max=timestamp_log_max
+    )
+
+    # train_dataset = CANDatasetEnetWithNormalizingTs(
+    #     root_dir=opt.data_folder, window_size=32, is_train=True, is_test=False, transform=TwoCropTransform(train_transform), 
+    #     normalize_timestamp=True,
+    #     fit_timestamp_scaler=True)
+
+    # timestamp_log_min = train_dataset.timestamp_log_min
+    # timestamp_log_max = train_dataset.timestamp_log_max
+    
+    # test_dataset = CANDatasetEnetWithNormalizingTs(
+    #     root_dir=opt.data_folder, window_size=32, is_train=False, is_test=False, include_data=False, transform=transform,
+    #     normalize_timestamp=True,
+    #     fit_timestamp_scaler=False,
+    #     timestamp_log_min=timestamp_log_min,
+    #     timestamp_log_max=timestamp_log_max
+    # )
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers, pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.batch_size, shuffle=False, pin_memory=True)
@@ -255,7 +285,8 @@ def set_loader(opt):
     #     linewidth=200,
     #     sci_mode=False   
     # )
-    class_counts = calculate_class_counts(train_dataset)
+    # class_counts = calculate_class_counts(train_dataset)
+    class_counts = torch.zeros(opt.n_classes, dtype=torch.long)
     print("Print class counts here: ", class_counts)
 
     return train_loader, test_loader, train_classifier_loader, class_counts
@@ -266,13 +297,14 @@ def set_model(opt, class_counts):
     
     model = CCTRetNet(
         img_size = 64,
+        n_input_channels = opt.n_input_channels,
         embedding_dim = opt.embedding_dim, # the number of filters in the convolutional layers = the dimension of tokens before put into transformer encoder
-        n_conv_layers = 2, # number of convolutional layers
-        kernel_size = 3,
-        stride = 1,
-        padding = 1,
-        pooling_kernel_size = 2,
-        pooling_stride = 2,
+        n_conv_layers = opt.n_conv_layers, # number of convolutional layers
+        kernel_size = 3, # width = 8
+        stride = 1, # width = 8
+        padding = 1, # width = 0
+        pooling_kernel_size = 3, # width = 1 
+        pooling_stride = 2, # width = 1
         pooling_padding = 0,
         # num_layers = 4, # the number of transformer encoder layers
         # num_heads = 4, # the number of attention heads in each transformer encoder layer

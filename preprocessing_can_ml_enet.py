@@ -185,6 +185,9 @@ def split_data(file_name, attack_id, window_size, strided_size, target_size=64):
         'label': pd.Series(label.tolist())
     }, index=range(len(canid)))
 
+    print("Debug")
+    print(df.head())
+
     df['label'] = df['label'].apply(lambda x: attack_id if any(x) else 0)
 
     print("Aggregating data: Done")
@@ -212,8 +215,8 @@ def main(indir, outdir, attacks, window_size, strided, target_size=64):
 
         foutput_attack = '{}/{}'.format(outdir, attack)
         foutput_normal = '{}/Normal_{}'.format(outdir, attack)
-        df_attack = df[df['label'] != 0].sample(frac=0.2, random_state=42)
-        df_normal = df[df['label'] == 0].sample(frac=0.2, random_state=42)
+        df_attack = df[df['label'] != 0].sample(frac=0.1, random_state=42)
+        df_normal = df[df['label'] == 0].sample(frac=0.1, random_state=42)
         write_tfrecord(df_attack, foutput_attack)
         write_tfrecord(df_normal, foutput_normal)
         
@@ -226,8 +229,8 @@ def main(indir, outdir, attacks, window_size, strided, target_size=64):
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--indir', type=str, default="./data/can-ml/can-ml/2017-subaru-forester/merged")
-    parser.add_argument('--outdir', type=str, default="./data/can-ml/can-ml/2017-subaru-forester/220626/TFRecord")
+    parser.add_argument('--indir', type=str, default="./data/can-ml/can-ml/2017-subaru-forester/070726/merged")
+    parser.add_argument('--outdir', type=str, default="./data/can-ml/can-ml/2017-subaru-forester/070726/TFRecord")
     parser.add_argument('--window_size', type=int, default=64)
     parser.add_argument('--strided', type=int, default=32)
     args = parser.parse_args()
