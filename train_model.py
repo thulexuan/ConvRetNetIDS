@@ -1,29 +1,20 @@
 from __future__ import print_function
 
 import argparse
-from html import parser
 import math
 import os
-import random
 import sys
 import time
 import numpy as np
 from tqdm import tqdm
 import torch
 import torch.optim as optim
-import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import pprint
 from datetime import datetime
-from GPaCo.losses import PaCoLoss
-from dataset_backup_with_no_normalize import CANMLDataset
-from losses.EQLv2 import EQLv2Loss
-from losses.SeesawLoss import SeesawLossWithLogits
-from model import CANIDSConfig, CANIntrusionDetector
-from models.time_aware_retnet import TimeAwareRetNetCANIDS
-from networks.cnn_1d_modified_retnet import CNN1DModifiedRetNet
-from supcon.util import accuracy
-from util import AverageMeter, random_instance_masking
+from dataset import CANMLDataset
+from networks.conv_retnet import ConvRetNet
+from util import AverageMeter
 from util import warmup_learning_rate
 from util import save_model
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix
@@ -71,7 +62,7 @@ def parse_option():
                         help='momentum_classifier')
     
     # model dataset
-    parser.add_argument('--model', type=str, default='CCT-RetNet-GPaCo')
+    parser.add_argument('--model', type=str, default='Con-RetNet-IDS')
     parser.add_argument('--classifier_optimizer', type=str, default='Adam')
     parser.add_argument('--optimizer', type=str, default='Adam')
     parser.add_argument('--dataset', type=str, default='CAN-ML',
@@ -87,7 +78,7 @@ def parse_option():
                         help='number of class')
 
     # method
-    parser.add_argument('--method', type=str, default='GPaCo+sequence-input', 
+    parser.add_argument('--method', type=str, default='Residual+BiRetNet+SwiGLU', 
                         help='choose method')
 
     # other setting
@@ -106,11 +97,6 @@ def parse_option():
                         help='dimension of the projection layer to train feature space')
     parser.add_argument('--n_input_channels', default=9, type=int,
                     help='the number of input channels')
-    parser.add_argument('--kernel_size', default=3, type=int,
-                    help='the size of the kernel in the tokenizer')
-
-    parser.add_argument('--masking_ratio', type=float, default=0.15)
-    parser.add_argument('--ratio_highest_attention', type=float, default=0.35)
 
     # input sliding window parameters 
     parser.add_argument('--window_size', type=int, default=32,
@@ -123,22 +109,12 @@ def parse_option():
                     help='the number of RetNet blocks')
     parser.add_argument('--n_heads', default=4, type=int,
                     help='the number of RetNet retention layers in each block')
-    parser.add_argument('--n_conv_layers', default=2, type=int,
-                    help='the number of convolutional layers in tokenizer')
-
-    # GPaCo loss configuration
-    parser.add_argument('--alpha', default=0.05, type=float,
-                    help='contrast weight among samples')
-    parser.add_argument('--temp', default=0.07, type=float,
-                    help='temperature for contrastive learning')
     
-
     opt = parser.parse_args()
 
     opt.device = torch.device('cuda:0')
     # set the path according to the environment
     if opt.data_folder is None:
-        # opt.data_folder = './data/size_64_10/TFRecord_w64_s32/3/'
         opt.data_folder = './data/can-ml/can-ml/2017-subaru-forester/090726/preprocessed/rid2/TFRecord_w16_s1/'
     opt.model_path = './save/{}_models/{}'.format(opt.dataset, opt.method)
 
@@ -176,24 +152,6 @@ def parse_option():
     opt.tb_folder = os.path.join(opt.save_folder, 'runs')
     return opt
 
-def calculate_class_counts(dataset, num_classes=10):
-        class_counts = torch.zeros(num_classes, dtype=torch.long)
-
-        for idx in tqdm(range(len(dataset)), desc="Counting class labels"):
-            _, label = dataset[idx]
-
-            if torch.is_tensor(label):
-                label = label.item()
-
-            label = int(label)
-
-            if label < 0 or label >= num_classes:
-                raise ValueError(f"Invalid label {label} at index {idx}")
-
-            class_counts[label] += 1
-
-        return class_counts
-
 def set_loader(opt):
 
     train_dataset = CANMLDataset(
@@ -208,20 +166,14 @@ def set_loader(opt):
 
     print('Number of training samples: {}'.format(len(train_dataset)))
     print('Number of testing samples: {}'.format(len(test_dataset)))
-    # torch.set_printoptions(
-    #     precision=4,
-    #     threshold=float("inf"), # no truncation of tensor elements
-    #     linewidth=200,
-    #     sci_mode=False   
-    # )
    
     return train_loader, test_loader, train_classifier_loader, len(train_dataset)
 
-def set_model(opt, class_counts=None):
+def set_model(opt):
     torch.cuda.empty_cache()
     
 
-    model = TimeAwareRetNetCANIDS(
+    model = ConvRetNet(
                 num_features=opt.n_input_channels,
                 d_model=opt.embedding_dim,
                 out_channels_payload=opt.embedding_dim,
@@ -231,13 +183,9 @@ def set_model(opt, class_counts=None):
                 ffn_dim=opt.embedding_dim * 2,
                 num_classes=opt.n_classes,
                 dropout=0.1,
-                double_v_dim=True,
-                opt=opt
             )
 
-    # criterion_model = PaCoLoss(alpha=opt.alpha, temperature=opt.temp)
-    # criterion_model = torch.nn.CrossEntropyLoss()
-    criterion_model = EQLv2Loss(num_classes=opt.n_classes)
+    criterion_model = torch.nn.CrossEntropyLoss()
 
     criterion_ce = torch.nn.CrossEntropyLoss()
 
@@ -311,8 +259,7 @@ def train(train_loader, model, criterion_model, criterion_ce, optimizer, epoch, 
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
         feats, logits, projected = model(images) # (128, 128), (128, 10), (128, 64)
-        labels_one_hot = F.one_hot(labels, num_classes=opt.n_classes).float()
-        loss = criterion_model(logits, labels_one_hot) 
+        loss = criterion_model(logits, labels) 
         
         losses.update(loss.item(), bsz)
   
@@ -413,8 +360,7 @@ def main():
 
     # build data loader
     train_loader, test_loader, train_classifier_loader, num_of_training_samples = set_loader(opt)
-    class_counts = calculate_class_counts(train_loader.dataset, num_classes=opt.n_classes)
-    model, criterion_model, criterion_ce = set_model(opt, class_counts)
+    model, criterion_model, criterion_ce = set_model(opt)
 
     # build optimizer
     optimizer = set_optimizer(opt, model, optim_choice=opt.optimizer)
@@ -440,11 +386,10 @@ def main():
         print('Begin time: ' + str(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())))
         adjust_learning_rate(opt, optimizer, epoch)
 
-        # train model with CE loss
         new_step, train_loss = train(train_loader, model, criterion_model, criterion_ce, optimizer, epoch, opt, step)
 
-        print(f'Epoch {epoch}, 1DCNN-RetNet-CE Loss {train_loss:.4f}')
-        log_writer.write(f'Epoch: {epoch}, 1DCNN-RetNet-CE Loss: {train_loss:.4f}\n')
+        print(f'Epoch {epoch}, Training Loss {train_loss:.4f}')
+        log_writer.write(f'Epoch: {epoch}, Training Loss: {train_loss:.4f}\n')
         logger.add_scalar('train_loss/val', train_loss, step)
         train_losses.append(train_loss)
         print('Train Losses:', train_losses)

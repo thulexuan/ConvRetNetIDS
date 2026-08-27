@@ -2,16 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.bidirectional_retention_with_swiGLU import BidirectionalRetentionEncoder
-from models.payload_local_encoder_per_frame import PayloadLocalEncoderPerFrame
-from models.original_retention_module import RetNetBlock, RetNetEncoder
+from networks.bidirectional_retention_with_swiGLU import BidirectionalRetentionEncoder
+from networks.payload_local_encoder_per_frame import PayloadLocalEncoderPerFrame
+from networks.original_retention_module import RetNetBlock, RetNetEncoder
 
-class TimeAwareRetNetCANIDS(nn.Module):
-
-    # Vị trí cố định của các cột trong vector 11 chiều đầu vào.
-    NUM_PROJ_FEATURES = 10   # can_id, data0..7, inter_arrival_ts -> vào input_proj
-    INTER_ARRIVAL_COL = 9    # cột inter_arrival_ts (0-indexed, trong 11 cột)
-    RELATIVE_TS_COL = 10     # cột relative_ts (0-indexed, trong 11 cột) - CHỈ dùng cho retention
+class ConvRetNet(nn.Module):
 
     def __init__(
         self,
@@ -24,8 +19,6 @@ class TimeAwareRetNetCANIDS(nn.Module):
         ffn_dim: int = 256,
         num_classes: int = 10,
         dropout: float = 0.0,
-        double_v_dim: bool = False,
-        opt=None
     ):
         super().__init__()
        

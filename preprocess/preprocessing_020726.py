@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
-import pickle
 from pathlib import Path
 
 from matplotlib.pylab import seed
 import numpy as np
 import pandas as pd
-# import tensorflow as tf
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
 from torch import as_strided
-from tqdm import tqdm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,21 +17,11 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────────────────────────────────────
-WINDOW      = 128          # messages per sample
-IMG_SIZE    = 32           # 128 * 8 = 1024 = 32 * 32
-N_CH        = 3
-# CAN_ID_MAX  = 2047.0       # 11-bit standard CAN ID  (0x000–0x7FF)
-                           # 29-bit extended: change to 536870911.0
+WINDOW      = 128         
 
+ID_MIN, ID_MAX = 0, 2047      
+BYTE_MIN, BYTE_MAX = 0, 255    
 
-# ----- Hằng số theo bài báo -----
-ID_MIN, ID_MAX = 0, 2047       # CAN ID 11-bit
-BYTE_MIN, BYTE_MAX = 0, 255    # mỗi byte payload
-
-# ── Core normalization ────────────────────────────────────────────────────────
 def log_minmax(x: float, x_min: float, x_max: float) -> float:
     """
     Logarithmic Min-Max Normalization → [0, 1]
@@ -53,37 +38,17 @@ def log_minmax(x: float, x_min: float, x_max: float) -> float:
         return 0.0
     return float((lx - l_min) / denom)
 
-
-# >>> MỚI: khoảng cách thời gian với frame LIỀN TRƯỚC (inter-arrival) <<<
-def compute_inter_arrival(timestamps: pd.Series) -> pd.Series:
-    """
-    inter_arrival_ts[i] = timestamp[i] - timestamp[i-1]
-    inter_arrival_ts[0] = 0  (frame đầu tiên không có frame trước đó)
-    """
-    return timestamps.diff().fillna(0.0).astype("float32")
- 
- 
-# >>> MỚI: khoảng cách thời gian với frame CÓ TIMESTAMP BÉ NHẤT (relative) <<<
-def compute_relative_ts(timestamps: pd.Series) -> pd.Series:
-    """
-    relative_ts[i] = timestamp[i] - min(timestamp trên TOÀN BỘ dataframe)
-    """
-    return (timestamps - timestamps.min()).astype("float32")
- 
- 
-# ── CAN ID ────────────────────────────────────────────────────────────────────
 def process_can_id(arb_id) -> float:
     """
-    arbitration_id (decimal int hoặc string) → log-minmax normalized float
+    arbitration_id (decimal int or string) → log-minmax normalized float
  
-    Ví dụ:
+    Ex:
         140 → log_minmax(140, 0, 2047) ≈ 0.621
     """
     arb_id_dec = int(arb_id)
     return log_minmax(arb_id_dec, ID_MIN, ID_MAX)
  
  
-# ── Data field ────────────────────────────────────────────────────────────────
 def process_data_field(data_field) -> list:
     """
     data_field hex string → list 8 giá trị float32 đã normalize
@@ -94,7 +59,7 @@ def process_data_field(data_field) -> list:
         3. Mỗi byte: hex → decimal
         4. Log-MinMax normalize về [0, 1]
  
-    Ví dụ:
+    Ex:
         '0001240828282720'
         → ['00','01','24','08','28','28','27','20']
         → [0, 1, 36, 8, 40, 40, 39, 32]
@@ -111,10 +76,8 @@ def process_data_field(data_field) -> list:
             byte_dec = 0
         result.append(log_minmax(byte_dec, BYTE_MIN, BYTE_MAX))
  
-    return result   # list of 8 floats
+    return result   
  
- 
-# ── Apply to DataFrame ────────────────────────────────────────────────────────
 def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Nhận DataFrame có cột: timestamp, arbitration_id, data_field, attack
@@ -128,15 +91,12 @@ def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
     Tổng: 1 + 1 + 8 + 1 = 11 cột
     """
 
-    
-    
     out = pd.DataFrame()
  
     out["timestamp"] = df["timestamp"].values
  
     # CAN ID
     out["can_id"] = df["arbitration_id"].apply(process_can_id).astype("float32")
-    out["id_raw"] = df["arbitration_id"].values
  
     # Payload: tách thành 8 cột riêng biệt
     byte_cols = df["data_field"].apply(process_data_field)
@@ -146,14 +106,6 @@ def preprocess_df(df: pd.DataFrame) -> pd.DataFrame:
         dtype="float32",
     )
     out = pd.concat([out, byte_df], axis=1)
-
-    print(out[(out["id_raw"] == 209)].head(20))
-
-    # >>> MỚI: inter_arrival_ts - khoảng cách với frame liền trước
-    out["inter_arrival_ts"] = compute_inter_arrival(df["timestamp"])
-
-    # >>> MỚI: relative_ts - khoảng cách với timestamp bé nhất toàn dataframe
-    out["relative_ts"] = compute_relative_ts(df["timestamp"])
  
     out["attack"] = df["attack"].values.astype("int8")
  
@@ -194,7 +146,6 @@ def sample_10pct(X: np.ndarray, y: np.ndarray, attack_id: int, seed: int = 42):
 def load_attack_folder(filename: str, label, window_size=16, stride_size=16, verbose: bool = True) -> pd.DataFrame:
 
     try:
-        # process can id, payload
         df = pd.read_csv(filename)
 
         print("Length before removing: ", len(df))

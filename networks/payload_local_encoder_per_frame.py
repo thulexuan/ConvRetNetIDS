@@ -3,25 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class ResidualConvBlock1D(nn.Module):
-    """
-    Single-channel residual convolutional block used inside every branch
-    of the MC-1DCNN (Fig. 2 / Eq. 4-5 of the paper).
- 
-    Two Conv1d -> BatchNorm -> ReLU stages, with a residual (skip)
-    connection added around them, followed by dropout.
-    'same' padding is used so the temporal length T never changes,
-    which is required so the residual add is shape-compatible along T.
- 
-    NOTE:
-        When `in_channels != out_channels`, a plain identity skip is no
-        longer shape-compatible on the CHANNEL dimension (only T is kept
-        the same by padding). In that case a 1x1 Conv1d + BatchNorm
-        "shortcut" projection is used to map the input to `out_channels`
-        before the residual addition (standard ResNet-style projection
-        shortcut, He et al., 2016). When `in_channels == out_channels`,
-        the shortcut is a plain identity (no extra parameters), matching
-        Eq. (5) of the paper exactly.
-    """
  
     def __init__(
         self,
@@ -75,13 +56,6 @@ class PayloadLocalEncoderPerFrame(nn.Module):
     Output:
         h: (B, T, out_channels)
  
-    Each CAN frame contains 9 features (e.g. 1 CAN ID + 8 payload bytes).
-    All Conv1d layers use kernel_size=1, therefore no temporal mixing
-    occurs between neighboring CAN frames.
- 
-    Channel schedule of the stacked residual blocks:
-        - 1st block : in_channels=9            -> out_channels
-        - blocks 2..n_res_blocks : in_channels=out_channels -> out_channels
     """
  
     def __init__(

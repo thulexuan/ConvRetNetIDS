@@ -2,35 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import math
-from typing import List, Tuple
  
-# ---------------------------------------------------------------------------
-# Multi-scale decay rates (Eq. 8): gamma = 1 - 2^(-5-arange(0,h))
-# ---------------------------------------------------------------------------
+
 def _get_decay_gammas(num_heads: int) -> torch.Tensor:
-    """
-    Different retention heads use different decay rates gamma_i.
-    - small gamma  -> fast decay  -> head attends mostly to RECENT frames
-      (good for sudden bursts: DoS / Fuzzy attacks).
-    - gamma close to 1 -> slow decay -> head aggregates a LONG context
-      (good for subtle, slow-drifting anomalies: GEAR / RPM / Replay).
-    """
+ 
     return 1 - torch.pow(2.0, -5 - torch.arange(num_heads, dtype=torch.float32))
  
- 
-# ---------------------------------------------------------------------------
-# Single-head retention (Section 2.1)
-# ---------------------------------------------------------------------------
 class SimpleRetention(nn.Module):
-    """
-    One retention head, supporting both computation paradigms:
-      - forward_parallel  : Eq. (5), used for training / offline inference.
-      - forward_recurrent : Eq. (6), used for O(1) streaming inference.
- 
-    Both paths are mathematically equivalent (this is checked in the
-    __main__ sanity test at the bottom of this file).
-    """
  
     def __init__(self, hidden_size: int, head_size: int, gamma: float, double_v_dim: bool = False):
         super().__init__()
@@ -68,28 +46,9 @@ class SimpleRetention(nn.Module):
         out = A @ V                                          # (B,T,v_dim)
         return out
  
-    def forward_recurrent(self, x_n: torch.Tensor, S_prev: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Single-timestep recurrent update (Eq. 6).
-        x_n   : (B, hidden_size)          -- current frame's fused feature
-        S_prev: (B, head_size, v_dim)     -- previous recurrent state
-        returns (out_n, S_n)
-        """
-        Q_n = (x_n @ self.W_Q) * self.scale     # (B, head_size)
-        K_n = x_n @ self.W_K                    # (B, head_size)
-        V_n = x_n @ self.W_V                    # (B, v_dim)
- 
-        S_n = self.gamma * S_prev + K_n.unsqueeze(-1) @ V_n.unsqueeze(-2)  # (B, head_size, v_dim)
-        out_n = (Q_n.unsqueeze(1) @ S_n).squeeze(1)                        # (B, v_dim)
-        return out_n, S_n
- 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         return self.forward_parallel(X)
  
- 
-# ---------------------------------------------------------------------------
-# Multi-Scale Retention (MSR), Eq. (8)
-# ---------------------------------------------------------------------------
 class MultiScaleRetention(nn.Module):
     """
     Gated Multi-Scale Retention: h heads, each with its own decay gamma_i,
@@ -113,8 +72,6 @@ class MultiScaleRetention(nn.Module):
             ]
         )
  
-        # GroupNorm normalizes each head's output separately (heads have
-        # different gamma -> different output variance statistics).
         self.group_norm = nn.GroupNorm(num_heads, num_heads * self.v_dim)
         self.W_G = nn.Parameter(torch.randn(hidden_size, num_heads * self.v_dim) / hidden_size)
         self.W_O = nn.Parameter(torch.randn(num_heads * self.v_dim, hidden_size) / hidden_size)
@@ -125,13 +82,6 @@ class MultiScaleRetention(nn.Module):
         head_outs = [ret(X) for ret in self.retentions]     # each (B,T,v_dim)
         Y = torch.cat(head_outs, dim=-1)                    # (B,T,C) where C=num_heads*v_dim
  
-        # IMPORTANT: GroupNorm must normalize each timestep INDEPENDENTLY
-        # (per-token), exactly like forward_recurrent does for a single step
-        # (spatial size = 1). If we naively ran GroupNorm on (B,C,T), it
-        # would aggregate statistics ACROSS the T dimension as well, which
-        # is a different (non-causal, T-dependent) operation and breaks the
-        # parallel/recurrent equivalence. So we flatten (B,T) into the batch
-        # dimension before calling GroupNorm, then reshape back.
         C = Y.shape[-1]
         Y = Y.reshape(B * T, C, 1)
         Y = self.group_norm(Y)
@@ -141,36 +91,6 @@ class MultiScaleRetention(nn.Module):
         out = (gate * Y) @ self.W_O
         return out
  
-    def forward_recurrent(
-        self, x_n: torch.Tensor, states: List[torch.Tensor]
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        """
-        x_n   : (B, hidden_size)
-        states: list of per-head recurrent states, see `init_recurrent_state`
-        """
-        outs, new_states = [], []
-        for ret, S_prev in zip(self.retentions, states):
-            o_n, S_n = ret.forward_recurrent(x_n, S_prev)
-            outs.append(o_n)
-            new_states.append(S_n)
- 
-        Y = torch.cat(outs, dim=-1).unsqueeze(1)                     # (B,1,C)
-        Y = self.group_norm(Y.transpose(1, 2)).transpose(1, 2).squeeze(1)  # (B,C)
- 
-        gate = F.silu(x_n @ self.W_G)
-        out = (gate * Y) @ self.W_O
-        return out, new_states
- 
-    def init_recurrent_state(self, batch_size: int, device, dtype) -> List[torch.Tensor]:
-        return [
-            torch.zeros(batch_size, self.head_size, self.v_dim, device=device, dtype=dtype)
-            for _ in range(self.num_heads)
-        ]
- 
- 
-# ---------------------------------------------------------------------------
-# RetNet block: pre-LN residual MSR + FFN (Eq. 9)
-# ---------------------------------------------------------------------------
 class FeedForward(nn.Module):
     def __init__(self, hidden_size: int, ffn_size: int, dropout: float = 0.0):
         super().__init__()
@@ -186,7 +106,6 @@ class RetNetBlock(nn.Module):
     """
     Y = MSR(LN(X)) + X
     X = FFN(LN(Y)) + Y
-    (Eq. 9 of the paper)
     """
  
     def __init__(
@@ -208,17 +127,9 @@ class RetNetBlock(nn.Module):
         out = self.ffn(self.ln2(y)) + y
         return out
  
-    def forward_recurrent(
-        self, x_n: torch.Tensor, states: List[torch.Tensor]
-    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        y_n, new_states = self.msr.forward_recurrent(self.ln1(x_n), states)
-        y_n = y_n + x_n
-        out_n = self.ffn(self.ln2(y_n)) + y_n
-        return out_n, new_states
  
  
 class RetNetEncoder(nn.Module):
-    """Stack of L RetNetBlocks (the temporal module, replacing STDLM's MC-GTCN)."""
  
     def __init__(
         self,
@@ -242,14 +153,3 @@ class RetNetEncoder(nn.Module):
             x = layer(x)
         return x
  
-    def forward_recurrent(
-        self, x_n: torch.Tensor, states_list: List[List[torch.Tensor]]
-    ) -> Tuple[torch.Tensor, List[List[torch.Tensor]]]:
-        new_states_list = []
-        for layer, states in zip(self.layers, states_list):
-            x_n, new_states = layer.forward_recurrent(x_n, states)
-            new_states_list.append(new_states)
-        return x_n, new_states_list
- 
-    def init_recurrent_state(self, batch_size: int, device, dtype) -> List[List[torch.Tensor]]:
-        return [layer.msr.init_recurrent_state(batch_size, device, dtype) for layer in self.layers]
