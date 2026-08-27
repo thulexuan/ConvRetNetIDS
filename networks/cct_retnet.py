@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from networks.can_tokenizer_unified import UnifiedCANTokenizer
+from networks.conv1D_tokenizer import MC1DCNNTokenizer
 from networks.torchscale.architecture.retnet import RetNetDecoder
 from networks.torchscale.config.config import RetNetConfig
 
@@ -299,6 +300,8 @@ class TransformerClassifier(nn.Module):
         else:
             self.fc = nn.Linear(embedding_dim, num_classes) # num_classes ~ projection_dim
         # self.fc = nn.Linear(embedding_dim, num_classes)
+
+        self.input_proj = nn.Linear(9, embedding_dim) # project input from 9 channels to embedding_dim channels
         
         self.apply(self.init_weight)
     
@@ -354,7 +357,11 @@ class TransformerClassifier(nn.Module):
 
         return x # shape is (128, 128) ~ (batch_size, embedding_dim)
 
-    def forward(self, x):
+    def forward(self, x): # (128, 16, 128) ~ (batch_size, sequence_length, token_embedding_dim)
+
+        # Project features → token embeddings
+        # x = self.input_proj(x)
+
         x_before_fc = self.get_feature_before_fc(x) # (128, 128)
         x_after_fc = self.fc(x_before_fc) # (128, 128) -> (128, 64)
         return x_before_fc, x_after_fc # chưa l2-normalize, x has shape (128, num_classes), ở đây num_classes=projection_dim=64
@@ -376,6 +383,7 @@ class CCTRetNet(nn.Module):
         self,
         img_size=64,
         embedding_dim=128, # dimension of each token after tokenization = the number of filters in convolutional layers
+        window_size=29,
         n_input_channels=3,
         n_conv_layers=2,
         kernel_size=3,
@@ -392,11 +400,12 @@ class CCTRetNet(nn.Module):
         n_layers=2,
         n_heads=2,
         num_classes=10,
-        positional_embedding='learnable',
+        positional_embedding='none',
         *args, **kwargs
     ):
         super().__init__()
         img_height, img_width = pair(img_size)
+        self.window_size=window_size,
 
         self.tokenizer = Tokenizer(n_input_channels=n_input_channels,  # number of channels in the input image. after implementing convolution, image from [3, 64, 64] -> [embedding_dim, 64, 64]
                                    n_output_channels=embedding_dim, # the number of filters
@@ -410,35 +419,23 @@ class CCTRetNet(nn.Module):
                                    activation=nn.ReLU,
                                    n_conv_layers=n_conv_layers, # number of comvolutional layers
                                    conv_bias=False)
-
-        #####------
-        # self.tokenizer = UnifiedCANTokenizer(
-        #     n_input_channels=3,
-        #     n_output_channels=embedding_dim,  # 128 hoặc 256
-        #     in_planes=64,
-        # )
-
+        
         self.encoder = TransformerClassifier(
             sequence_length=self.tokenizer.sequence_length(n_channels=n_input_channels, # number of channels in the input image (3)
                                                            height=img_height,
                                                            width=img_width),
-            # sequence_shape=self.tokenizer.sequence_shape(n_channels=n_input_channels, # number of channels in the input image (3)
-            #                                                height=img_height,
-            #                                                width=img_width),
-            embedding_dim=embedding_dim, # 128
+            embedding_dim=embedding_dim, # 144
             seq_pool=True,
             dropout_rate=dropout_rate,
             attention_dropout=attention_dropout,
             stochastic_depth_rate=stochastic_depth_rate,
-            n_layers=2,
-            n_heads=2,
+            n_layers=n_layers,
+            n_heads=n_heads,
             num_classes=projection_dim,
             positional_embedding=positional_embedding,
             *args, **kwargs)
     
         self.fc = nn.Linear(embedding_dim, num_classes) # for supervised loss, shape is (128, 10)
-        self.head_fc = nn.Sequential(nn.Linear(embedding_dim, embedding_dim), nn.BatchNorm1d(embedding_dim), nn.ReLU(inplace=True),
-                                   nn.Linear(embedding_dim, projection_dim))
         
         # add projection head, projection_dim: feature dimension used for contrastive learning
         if projection_head == 'linear':
@@ -457,12 +454,12 @@ class CCTRetNet(nn.Module):
     
     def forward(self, x): # (128, 3, 64, 64)
         
-        x = self.tokenizer(x)
-        x_before_fc, x_after_fc = self.encoder(x) # x_before_fc (128, 128), x_after_fc (128, 64)
+        x = self.tokenizer(x) # x shape is (128, 32*32, 128) ~ (batch_size, sequence_length, token_embedding_dim)
+        x_before_projection, x_after_projection = self.encoder(x) # x_before_fc (128, 128), x_after_fc (128, 64)
         # print("check")
         # print(x_before_fc.shape, x_after_fc.shape)
 
-        return x_before_fc, F.normalize(x_after_fc, dim=1) # x_after_fc shape is (128, 64), L2-normalized
+        return x_before_projection, F.normalize(x_after_projection, dim=1) # x_after_fc shape is (128, 64), L2-normalized
     
 # class CCTRetNetNoProjectionHead(nn.Module):
 #     def __init__(

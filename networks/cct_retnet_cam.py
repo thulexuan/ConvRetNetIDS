@@ -1,0 +1,603 @@
+import torch
+from torch import nn, einsum
+import torch.nn.functional as F
+
+from einops import rearrange, repeat
+
+from networks.can_tokenizer_unified import UnifiedCANTokenizer
+from networks.conv1D_tokenizer import MC1DCNNTokenizer
+from networks.torchscale.architecture.retnet import RetNetDecoder
+from networks.torchscale.config.config import RetNetConfig
+
+# helpers
+
+def exists(val):
+    return val is not None
+
+def default(val, d):
+    return val if exists(val) else d
+
+def pair(t):
+    return t if isinstance(t, tuple) else (t, t)
+
+# CCT Models
+
+__all__ = ['cct_2', 'cct_4', 'cct_6', 'cct_7', 'cct_8', 'cct_14', 'cct_16']
+
+# positional
+
+def sinusoidal_embedding(n_channels, dim): # 1D positional embedding, cho biết token index chứ k cho biết token nằm ở hàng nào, cột nào
+    pe = torch.FloatTensor([[p / (10000 ** (2 * (i // 2) / dim)) for i in range(dim)]
+                            for p in range(n_channels)])
+    pe[:, 0::2] = torch.sin(pe[:, 0::2])
+    pe[:, 1::2] = torch.cos(pe[:, 1::2])
+    return rearrange(pe, '... -> 1 ...')
+
+def sinusoidal_embedding_2d(height, width, dim):
+    if dim <= 1:
+        return sinusoidal_embedding(height * width, dim)
+
+    row_dim = dim // 2
+    col_dim = dim - row_dim
+
+    row_pe = sinusoidal_embedding(height, row_dim).squeeze(0)
+    col_pe = sinusoidal_embedding(width, col_dim).squeeze(0)
+
+    row_pe = repeat(row_pe, 'h d -> h w d', w=width)
+    col_pe = repeat(col_pe, 'w d -> h w d', h=height)
+
+    pe = torch.cat([row_pe, col_pe], dim=-1)
+    return rearrange(pe, 'h w d -> 1 (h w) d')
+
+# modules
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob=None):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x):
+        batch, drop_prob, device, dtype = x.shape[0], self.drop_prob, x.device, x.dtype
+
+        if drop_prob <= 0. or not self.training:
+            return x
+
+        keep_prob = 1 - self.drop_prob
+        shape = (batch, *((1,) * (x.ndim - 1)))
+
+        keep_mask = torch.zeros(shape, device = device).float().uniform_(0, 1) < keep_prob
+        output = x.div(keep_prob) * keep_mask.float()
+        return output
+
+class Tokenizer(nn.Module):
+    def __init__(self,
+                 kernel_size, stride, padding,
+                 pooling_kernel_size=3, pooling_stride=2, pooling_padding=1,
+                 n_conv_layers=1,
+                 n_input_channels=3,
+                 n_output_channels=64,  # = embedding_dim 
+                 in_planes=64,
+                 activation=None,
+                 max_pool=True,
+                 conv_bias=False):
+        super().__init__()
+
+        self.n_input_channels = n_input_channels
+
+        # def _make_branch():
+        #     # Each branch takes a single-channel input.
+        #     # n_filter_list: 1 -> [in_planes] * (n_conv_layers-1) -> n_output_channels
+        #     n_filter_list = [1] + \
+        #                     [in_planes for _ in range(n_conv_layers - 1)] + \
+        #                     [n_output_channels]
+        #     n_filter_list_pairs = list(zip(n_filter_list[:-1], n_filter_list[1:]))
+        #     return nn.Sequential(
+        #         *[nn.Sequential(
+        #             nn.Conv2d(chan_in, chan_out,
+        #                       kernel_size=(kernel_size, kernel_size),
+        #                       stride=(stride, stride),
+        #                       padding=(padding, padding), bias=conv_bias),
+        #             nn.Identity() if not exists(activation) else activation(),
+        #             nn.MaxPool2d(kernel_size=pooling_kernel_size,
+        #                          stride=pooling_stride,
+        #                          padding=pooling_padding) if max_pool else nn.Identity()
+        #         )
+        #             for chan_in, chan_out in n_filter_list_pairs
+        #         ])
+
+        n_filter_list = [n_input_channels] + \
+                        [in_planes for _ in range(n_conv_layers - 1)] + \
+                        [n_output_channels] # build list các convolutional layer, if 1 layer, biến đổi từ 3 channel qua embedding_dim channel, if 2 layer, biến đổi từ 3 channel qua in_planes channel rồi qua embedding_dim channel
+
+        n_filter_list_pairs = zip(n_filter_list[:-1], n_filter_list[1:])
+
+        self.conv_layers = nn.Sequential(
+            *[nn.Sequential(
+                nn.Conv2d(chan_in, chan_out,
+                          kernel_size=kernel_size, # (3, 8)
+                          stride=stride, # (1, 8)
+                          padding=padding, bias=conv_bias), # (1, 0)
+                # nn.BatchNorm2d(chan_out),
+                nn.Identity() if not exists(activation) else activation(),
+                nn.MaxPool2d(kernel_size=pooling_kernel_size, # (3, 1)
+                             stride=pooling_stride, # (2, 1)
+                             padding=pooling_padding) if max_pool else nn.Identity()
+            )
+                for chan_in, chan_out in n_filter_list_pairs
+            ])
+
+        # ---- 2 layers
+        # n_filter_list = [n_input_channels] + \
+        #         [in_planes for _ in range(n_conv_layers - 1)] + \
+        #         [n_output_channels]  # build list các convolutional layer, if 1 layer, biến đổi từ 3 channel qua embedding_dim channel, if 2 layer, biến đổi từ 3 channel qua in_planes channel rồi qua embedding_dim channel
+
+        # n_filter_list_pairs = list(zip(n_filter_list[:-1], n_filter_list[1:]))
+
+        # layers = []
+        # for layer_idx, (chan_in, chan_out) in enumerate(n_filter_list_pairs):
+        #     if layer_idx == 0:
+        #         # LAYER 1: kernel bám boundary raw image - mỗi 8 cột = 1 message,
+        #         # stride=8 để không chồng lấn qua ranh giới message
+        #         # k, s, pad = (3, 8), (1, 8), (1, 0)
+        #         k, s, pad = (3, 3), (1, 1), (1, 1)
+        #     else:
+        #         # LAYER 2 TRỞ ĐI: feature map đã trừu tượng hóa, không còn ý nghĩa
+        #         # "byte-boundary" -> dùng kernel CHUẨN (3,3), "same" padding
+        #         k, s, pad = (3, 3), (1, 1), (1, 1)
+
+        #     layers.append(nn.Sequential(
+        #         nn.Conv2d(chan_in, chan_out,
+        #                 kernel_size=k,
+        #                 stride=s,
+        #                 padding=pad, bias=conv_bias),
+        #         nn.BatchNorm2d(chan_out),  # bật lại BN - đặt ngay sau Conv2d
+        #         nn.Identity() if not exists(activation) else activation(),
+        #         nn.MaxPool2d(kernel_size=(3, 1),
+        #                     stride=(2, 1),
+        #                     padding=pooling_padding) if max_pool else nn.Identity()
+        #     ))
+
+        # self.conv_layers = nn.Sequential(*layers)
+        # ----
+        # One independent branch per input channel
+        # self.channel_branches = nn.ModuleList([_make_branch() for _ in range(n_input_channels)])
+
+        self.apply(self.init_weight)
+    
+    def _forward_single_channel(self, branch, x_c):
+        """Run one channel tensor (B, 1, H, W) through its branch → (B, H'*W', C)."""
+        return rearrange(branch(x_c), 'b c h w -> b (h w) c')
+
+    def sequence_length(self, n_channels=3, height=64, width=64):
+        return self.forward(torch.zeros((1, n_channels, height, width))).shape[1]
+
+    def sequence_shape(self, n_channels=3, height=64, width=64):
+        """Return the spatial shape (H', W') after the convolutional tokenizer."""
+        with torch.no_grad():
+            out = self.conv_layers(torch.zeros((1, n_channels, height, width)))
+        return out.shape[-2], out.shape[-1]
+    
+    # def forward(self, x): # x ~ (128, 3, 64, 64)
+    #     # x: (B, n_input_channels, H, W)
+    #     # Split into individual channel tensors and process each independently
+    #     channel_tokens = [
+    #         self._forward_single_channel(branch, x[:, i:i+1, :, :])
+    #         for i, branch in enumerate(self.channel_branches)
+    #     ]
+    #     # Concatenate along the sequence dimension → (B, n_input_channels * H'*W', embedding_dim)
+    #     return torch.cat(channel_tokens, dim=1)
+
+    def forward(self, x):
+        # print("Investigating the input x after convolution but before rearrange: ", self.conv_layers(x).shape) # expected shape is (batch_size, 3, 64, 64)
+        return rearrange(self.conv_layers(x), 'b c h w -> b (h w) c')
+
+    @staticmethod
+    def init_weight(m):
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight)
+
+class ChannelAttentionModule(nn.Module):
+    """
+    Channel Attention Mechanism (CAM), theo Xiong et al. (2026) - STDLM.
+    Áp dụng ý tưởng Squeeze-and-Excitation (Hu et al., 2018) lên chuỗi
+    token dạng "channel-last" (batch, sequence_length, embedding_dim),
+    đúng format mà RetNetDecoder xuất ra trong pipeline này.
+
+    Vai trò: sau khi retention (đóng vai trò MC-GTCN trong STDLM) học xong
+    đặc trưng spatio-temporal, không phải mọi "kênh" (embedding dimension)
+    đều quan trọng như nhau đối với việc phát hiện 1 loại tấn công cụ thể.
+    CAM học 1 trọng số attention cho từng chiều embedding, khuếch đại
+    kênh liên quan đến tấn công và suy giảm kênh nhiễu, trước khi đưa vào
+    seq-pool / classification.
+
+    Input:  x ∈ (batch, sequence_length, embedding_dim)
+    Output: x' ∈ (batch, sequence_length, embedding_dim)  (cùng shape)
+    """
+
+    def __init__(self, embedding_dim, reduction_ratio=4):
+        super().__init__()
+        reduced_dim = max(1, embedding_dim // reduction_ratio)
+
+        # F_ez(.): 2 lớp FC dạng bottleneck, học trọng số attention cho từng
+        # chiều embedding (channel), dựa trên biểu diễn toàn cục của chuỗi.
+        self.excitation = nn.Sequential(
+            nn.Linear(embedding_dim, reduced_dim, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced_dim, embedding_dim, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        # x: (batch, sequence_length, embedding_dim)
+
+        # F_sq(.): Squeeze - global average pooling theo chiều sequence,
+        # mỗi kênh (embedding dim) chỉ còn 1 giá trị đại diện.
+        z = x.mean(dim=1)  # (batch, embedding_dim)
+
+        # F_ez(.): Excitation - học trọng số attention, giá trị trong [0, 1]
+        s = self.excitation(z)  # (batch, embedding_dim)
+
+        # F_scale(.): Scale - nhân element-wise (broadcast theo sequence_length)
+        # trọng số vào feature gốc.
+        s = s.unsqueeze(1)  # (batch, 1, embedding_dim)
+        return x * s  # (batch, sequence_length, embedding_dim)
+
+
+class TransformerClassifier(nn.Module):
+    def __init__(self,
+                 seq_pool=True,
+                 embedding_dim=128, # 256
+                 n_layers=2, # 2
+                 n_heads=2, # 2
+                 mlp_ratio=4.0, # 1
+                 num_classes=64,
+                 dropout_rate=0.1,
+                 attention_dropout=0.1,
+                 stochastic_depth_rate=0.1,
+                 positional_embedding='learnable',
+                 sequence_length=None,
+                 sequence_shape=None,
+                 mlp=True,
+                 use_channel_attention=True,
+                 cam_reduction_ratio=4,
+                 *args, **kwargs):
+        super().__init__()
+        assert positional_embedding in {'sine', 'learnable', 'none', 'sine_2d', 'learnable_2d'}
+
+        dim_feedforward = int(embedding_dim * mlp_ratio)
+        self.embedding_dim = embedding_dim
+        self.sequence_length = sequence_length
+        self.sequence_shape = sequence_shape
+        self.seq_pool = seq_pool
+
+        # positional embedding
+        self.positional_embedding_type = positional_embedding
+        self.positional_emb = None
+        self.row_positional_emb = None
+        self.col_positional_emb = None
+        self.cls_positional_emb = None
+
+        assert exists(sequence_length) or positional_embedding == 'none', \
+            f"Positional embedding is set to {positional_embedding} and" \
+            f" the sequence length was not specified."
+
+        if not seq_pool:  # if not using sequence pooling, add a class token and increase the sequence length by 1
+            sequence_length += 1
+            self.class_emb = nn.Parameter(torch.zeros(1, 1, self.embedding_dim), requires_grad=True)
+        else:
+            self.attention_pool = nn.Linear(self.embedding_dim, 1)
+
+        if positional_embedding == 'none':
+            self.positional_emb = None
+        elif positional_embedding == 'learnable':
+            self.positional_emb = nn.Parameter(torch.zeros(1, sequence_length, embedding_dim),
+                                               requires_grad=True)
+            nn.init.trunc_normal_(self.positional_emb, std=0.2)
+        elif positional_embedding == 'sine':
+            # 1D fixed sinusoidal positional embedding.
+            self.positional_emb = nn.Parameter(sinusoidal_embedding(sequence_length, embedding_dim),
+                                               requires_grad=False)
+
+        elif positional_embedding == 'sine_2d':
+            # 2D fixed sinusoidal positional embedding based on row and column coordinates.
+            h, w = sequence_shape
+            pos = sinusoidal_embedding_2d(h, w, embedding_dim)
+            if not seq_pool:
+                cls_pos = torch.zeros(1, 1, embedding_dim)
+                pos = torch.cat([cls_pos, pos], dim=1)
+            self.positional_emb = nn.Parameter(pos, requires_grad=False)
+
+        elif positional_embedding == 'learnable_2d':
+            # 2D learnable row-column positional embedding.
+            # PE(row, col) = concat(PE_row(row), PE_col(col))
+            h, w = sequence_shape
+            row_dim = embedding_dim // 2
+            col_dim = embedding_dim - row_dim
+            self.row_positional_emb = nn.Parameter(torch.zeros(1, h, 1, row_dim), requires_grad=True)
+            self.col_positional_emb = nn.Parameter(torch.zeros(1, 1, w, col_dim), requires_grad=True)
+            nn.init.trunc_normal_(self.row_positional_emb, std=0.2)
+            nn.init.trunc_normal_(self.col_positional_emb, std=0.2)
+            if not seq_pool:
+                self.cls_positional_emb = nn.Parameter(torch.zeros(1, 1, embedding_dim), requires_grad=True)
+                nn.init.trunc_normal_(self.cls_positional_emb, std=0.2)
+
+        self.dropout = nn.Dropout(p=dropout_rate)
+
+        # dpr = [x.item() for x in torch.linspace(0, stochastic_depth_rate, num_layers)]
+
+        config = RetNetConfig(
+            vocab_size=-1,
+            decoder_embed_dim=embedding_dim, 
+            decoder_value_embed_dim=embedding_dim * 2,
+            decoder_retention_heads=n_heads,
+            decoder_ffn_embed_dim=embedding_dim * 2,
+            decoder_layers=n_layers
+        )
+        
+        self.retnet_blocks = RetNetDecoder(args=config)
+
+        # Channel Attention Mechanism (CAM) - áp dụng lên output của
+        # retention module (đóng vai trò tương đương MC-GTCN trong STDLM),
+        # trước khi seq-pool / classification.
+        self.use_channel_attention = use_channel_attention
+        if self.use_channel_attention:
+            self.cam = ChannelAttentionModule(
+                embedding_dim=embedding_dim,
+                reduction_ratio=cam_reduction_ratio,
+            )
+
+        self.norm = nn.LayerNorm(embedding_dim)
+
+        if mlp: 
+            self.fc = nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(embedding_dim, num_classes)
+            )
+        else:
+            self.fc = nn.Linear(embedding_dim, num_classes) # num_classes ~ projection_dim
+        # self.fc = nn.Linear(embedding_dim, num_classes)
+
+        self.input_proj = nn.Linear(9, embedding_dim) # project input from 9 channels to embedding_dim channels
+        
+        self.apply(self.init_weight)
+    
+    def _get_positional_embedding(self):
+        if self.positional_embedding_type == 'learnable_2d':
+            return self._build_learnable_2d_positional_embedding()
+        return self.positional_emb
+
+    def _build_learnable_2d_positional_embedding(self):
+        """Build row-column learnable 2D positional embeddings at forward time."""
+        h, w = self.sequence_shape
+        row_pos = repeat(self.row_positional_emb, '1 h 1 d -> 1 h w d', w=w)
+        col_pos = repeat(self.col_positional_emb, '1 1 w d -> 1 h w d', h=h)
+        pos = torch.cat([row_pos, col_pos], dim=-1)
+        pos = rearrange(pos, '1 h w d -> 1 (h w) d')
+        if not self.seq_pool:
+            pos = torch.cat([self.cls_positional_emb, pos], dim=1)
+        return pos
+
+    def get_feature_before_fc(self, x): # when call Transformer Classifier, put x is a sequence of tokens
+        # print("Investigating the input x of Transformer Classifier: ", x.shape) # expectedshape is (batch_size, sequence_length, embedding_dim)
+        b = x.shape[0]
+
+        if not exists(self.positional_emb) and x.size(1) < self.sequence_length:
+            x = F.pad(x, (0, 0, 0, self.n_channels - x.size(1)), mode='constant', value=0)
+
+        if not self.seq_pool:
+            cls_token = repeat(self.class_emb, '1 1 d -> b 1 d', b = b)
+            x = torch.cat((cls_token, x), dim=1)
+
+        # if exists(self.positional_emb):
+        #     x += self.positional_emb
+        pos = self._get_positional_embedding()
+        if exists(pos):
+            if x.size(1) != pos.size(1):
+                raise ValueError(
+                    f"Token sequence length {x.size(1)} does not match positional embedding length {pos.size(1)}. "
+                    f"Check tokenizer output shape or positional_embedding setting."
+                )
+            x = x + pos.to(device=x.device, dtype=x.dtype)
+
+        
+        # with RetNet
+        x, _ = self.retnet_blocks(prev_output_tokens=x, token_embeddings=x) # (batch_size, sequence_length, embedding_dim)
+
+        # Channel Attention Mechanism (CAM): re-weight từng chiều embedding
+        # của đặc trưng spatio-temporal (fused feature) trước khi pooling.
+        # Shape không đổi: (batch_size, sequence_length, embedding_dim)
+        if self.use_channel_attention:
+            x = self.cam(x)
+
+        if self.seq_pool:
+            attn_weights = rearrange(self.attention_pool(x), 'b n 1 -> b n')
+            x = einsum('b n, b n d -> b d', attn_weights.softmax(dim = 1), x)
+        else:
+            x = x[:, -1] # get the last token, shape is (batch_size, embedding_dim)
+
+        # print("Print shape of feature before fc: ", x.shape)
+
+        return x # shape is (128, 128) ~ (batch_size, embedding_dim)
+
+    def forward(self, x): # (128, 16, 128) ~ (batch_size, sequence_length, token_embedding_dim)
+
+        # Project features → token embeddings
+        # x = self.input_proj(x)
+
+        x_before_fc = self.get_feature_before_fc(x) # (128, 128)
+        x_after_fc = self.fc(x_before_fc) # (128, 128) -> (128, 64)
+        return x_before_fc, x_after_fc # chưa l2-normalize, x has shape (128, num_classes), ở đây num_classes=projection_dim=64
+
+    @staticmethod
+    def init_weight(m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if isinstance(m, nn.Linear) and exists(m.bias):
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+# CCT-RetNet Main model
+
+class CCTRetNetCAM(nn.Module):
+    def __init__(
+        self,
+        img_size=64,
+        embedding_dim=128, # dimension of each token after tokenization = the number of filters in convolutional layers
+        window_size=64,
+        n_input_channels=3,
+        n_conv_layers=2,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        pooling_kernel_size=2,
+        pooling_stride=2,
+        pooling_padding=0,
+        dropout_rate=0.,
+        attention_dropout=0.1,
+        stochastic_depth_rate=0.1,
+        projection_head='mlp',
+        projection_dim=64,
+        n_layers=2,
+        n_heads=2,
+        num_classes=10,
+        positional_embedding='learnable',
+        use_channel_attention=True,
+        cam_reduction_ratio=4,
+        *args, **kwargs
+    ):
+        super().__init__()
+        img_height, img_width = pair(img_size)
+        self.window_size=window_size,
+
+        # self.tokenizer = Tokenizer(n_input_channels=n_input_channels,  # number of channels in the input image. after implementing convolution, image from [3, 64, 64] -> [embedding_dim, 64, 64]
+        #                            n_output_channels=embedding_dim, # the number of filters
+        #                            kernel_size=kernel_size,  # kernel size for convolutional layers
+        #                            stride=stride,
+        #                            padding=padding,
+        #                            pooling_kernel_size=pooling_kernel_size,
+        #                            pooling_stride=pooling_stride,
+        #                            pooling_padding=pooling_padding,
+        #                            max_pool=True,
+        #                            activation=nn.ReLU,
+        #                            n_conv_layers=n_conv_layers, # number of comvolutional layers
+        #                            conv_bias=False)
+
+        #####------
+        # self.tokenizer = UnifiedCANTokenizer(
+        #     n_input_channels=3,
+        #     n_output_channels=embedding_dim,  # 128 hoặc 256
+        #     in_planes=64,
+        # )
+
+        ####------ Conv1D tokenizer
+        self.tokenizer = MC1DCNNTokenizer()
+        
+        self.encoder = TransformerClassifier(
+            # sequence_length=self.tokenizer.sequence_length(n_channels=n_input_channels, # number of channels in the input image (3)
+            #                                                height=img_height,
+            #                                                width=img_width),
+            # with no tokenizer
+            sequence_length=window_size, # 16
+            # sequence_shape=self.tokenizer.sequence_shape(n_channels=n_input_channels, # number of channels in the input image (3)
+            #                                                height=img_height,
+            #                                                width=img_width),
+            embedding_dim=self.tokenizer.total_ch, # 144
+            seq_pool=True,
+            dropout_rate=dropout_rate,
+            attention_dropout=attention_dropout,
+            stochastic_depth_rate=stochastic_depth_rate,
+            n_layers=2,
+            n_heads=2,
+            num_classes=projection_dim,
+            positional_embedding=positional_embedding,
+            use_channel_attention=use_channel_attention,
+            cam_reduction_ratio=cam_reduction_ratio,
+            *args, **kwargs)
+    
+        self.fc = nn.Linear(embedding_dim, num_classes) # for supervised loss, shape is (128, 10)
+        self.head_fc = nn.Sequential(nn.Linear(embedding_dim, embedding_dim), nn.BatchNorm1d(embedding_dim), nn.ReLU(inplace=True),
+                                   nn.Linear(embedding_dim, projection_dim))
+        
+        # add projection head, projection_dim: feature dimension used for contrastive learning
+        if projection_head == 'linear':
+            self.head = nn.Linear(embedding_dim, projection_dim)
+        elif projection_head == 'mlp':
+            self.head = nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(embedding_dim, embedding_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(embedding_dim, projection_dim)
+            )
+        else:
+            raise NotImplementedError(
+                'head not supported: {}'.format(projection_head))
+    
+    def forward(self, x): # (128, 16, 9)
+        
+        x = self.tokenizer(x) # x shape is (128, 16, 128) ~ (batch_size, sequence_length, token_embedding_dim)
+        x_before_fc, x_after_fc = self.encoder(x) # x_before_fc (128, 128), x_after_fc (128, 64)
+        # print("check")
+        # print(x_before_fc.shape, x_after_fc.shape)
+
+        return x_before_fc, F.normalize(x_after_fc, dim=1) # x_after_fc shape is (128, 64), L2-normalized
+    
+# class CCTRetNetNoProjectionHead(nn.Module):
+#     def __init__(
+#         self,
+#         img_size=64,
+#         embedding_dim=256, # dimension of each token after tokenization = the number of filters in convolutional layers
+#         n_input_channels=3,
+#         n_conv_layers=2,
+#         kernel_size=3,
+#         stride=1,
+#         padding=1,
+#         pooling_kernel_size=2,
+#         pooling_stride=2,
+#         pooling_padding=0,
+#         dropout_rate=0.,
+#         attention_dropout=0.1,
+#         stochastic_depth_rate=0.1,
+#         *args, **kwargs
+#     ):
+#         super().__init__()
+#         img_height, img_width = pair(img_size)
+
+#         self.tokenizer = Tokenizer(n_input_channels=n_input_channels,  # number of channels in the input image. after implementing convolution, image from [3, 64, 64] -> [embedding_dim, 64, 64]
+#                                    n_output_channels=embedding_dim, # the number of filters
+#                                    kernel_size=kernel_size,  # kernel size for convolutional layers
+#                                    stride=stride,
+#                                    padding=padding,
+#                                    pooling_kernel_size=pooling_kernel_size,
+#                                    pooling_stride=pooling_stride,
+#                                    pooling_padding=pooling_padding,
+#                                    max_pool=True,
+#                                    activation=nn.ELU,
+#                                    n_conv_layers=n_conv_layers, # number of comvolutional layers
+#                                    conv_bias=False)
+
+#         self.classifier = TransformerClassifier(
+#             sequence_length=self.tokenizer.sequence_length(n_channels=n_input_channels, # number of channels in the input image (3)
+#                                                            height=img_height,
+#                                                            width=img_width),
+#             embedding_dim=embedding_dim, # 256
+#             seq_pool=True,
+#             dropout_rate=dropout_rate,
+#             attention_dropout=attention_dropout,
+#             stochastic_depth_rate=stochastic_depth_rate,
+#             *args, **kwargs)
+    
+#     def encode(self, x): # (128, 3, 64, 64)
+#         x = self.tokenizer(x)
+#         return self.classifier.get_features(x) # (128, 256)
+
+#     def forward(self, x): # (128, 3, 64, 64)
+
+#         x = self.tokenizer(x)
+
+#         return self.classifier(x) # shape is (128, 10)

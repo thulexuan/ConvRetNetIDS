@@ -393,3 +393,4 @@ def add_actual_attack_col(df, intervals, aid, payload, attack_name):
     else:
         df['label'] = df.time.apply(lambda x: sum(x >= intvl[0]  and x <= intvl[1] for intvl in intervals ) >= 1) & (df.data == payload)
     return df
+

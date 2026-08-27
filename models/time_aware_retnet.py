@@ -1,0 +1,96 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from models.bidirectional_retention_with_swiGLU import BidirectionalRetentionEncoder
+from models.payload_local_encoder_per_frame import PayloadLocalEncoderPerFrame
+from models.original_retention_module import RetNetBlock, RetNetEncoder
+
+class TimeAwareRetNetCANIDS(nn.Module):
+
+    # Vị trí cố định của các cột trong vector 11 chiều đầu vào.
+    NUM_PROJ_FEATURES = 10   # can_id, data0..7, inter_arrival_ts -> vào input_proj
+    INTER_ARRIVAL_COL = 9    # cột inter_arrival_ts (0-indexed, trong 11 cột)
+    RELATIVE_TS_COL = 10     # cột relative_ts (0-indexed, trong 11 cột) - CHỈ dùng cho retention
+
+    def __init__(
+        self,
+        num_features: int = 9,
+        d_model: int = 128,
+        out_channels_payload: int = 128,
+        window_size: int = 32,
+        num_layers: int = 2,
+        num_heads: int = 4,
+        ffn_dim: int = 256,
+        num_classes: int = 10,
+        dropout: float = 0.0,
+        double_v_dim: bool = False,
+        opt=None
+    ):
+        super().__init__()
+       
+        self.num_features = num_features
+        self.d_model = d_model
+        self.window_size = window_size  # số frame trong mỗi window (T=window_size) - cố định, không thay đổi
+
+        self.payload_local_encoder = PayloadLocalEncoderPerFrame(
+            in_channels=9,  # can_id + 8 byte payload 
+            out_channels=out_channels_payload,
+            dropout=dropout
+        )
+
+        # self.temporal_encoder = RetNetEncoder(
+        #     hidden_size=d_model,
+        #     num_layers=num_layers,
+        #     num_heads=num_heads,
+        #     ffn_size=ffn_dim,
+        #     dropout=dropout,
+        #     double_v_dim=double_v_dim,
+        # ) # uni-retention
+
+        self.temporal_encoder = BidirectionalRetentionEncoder(
+            dim=d_model,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dropout=dropout,
+            use_gated_decay=False,
+            gated_decay_value_dim=16,
+        ) # có swiGLU
+        
+        self.final_ln = nn.LayerNorm(d_model)
+
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * d_model, d_model),
+            nn.ReLU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
+        """
+        x: (B, T, 9) = [can_id, data0..7]
+        """
+
+        id_payload_features = x[:, :, 0:9]  # cột can_id + data0..7 
+
+        final_encode_feat = self.payload_local_encoder(id_payload_features) # (B, T, d_model)
+
+        final_encode_feat = self.temporal_encoder(final_encode_feat)  # (B, T, d_model)
+        final_encode_feat = self.final_ln(final_encode_feat)
+
+        mean_pooled_feat = final_encode_feat.mean(dim=1)  # (B, d_model)
+        max_pooled_feat = final_encode_feat.max(dim=1).values  # (B, d_model)
+
+        pooled_feat = torch.cat([mean_pooled_feat, max_pooled_feat], dim=1)  # (B, 2*d_model)
+
+        logits = self.classifier(pooled_feat)  # (B, num_classes)
+
+        return final_encode_feat, logits, None     
+
+    
+
+
+

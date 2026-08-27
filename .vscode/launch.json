@@ -5,11 +5,16 @@
       "name": "Debug Python file",
       "type": "debugpy",
       "request": "launch",
-      "program": "../train_test_split_all.py",
+      // "program": "../preprocessing_020726.py",
+      "program": "../train_1dcnn_retnet_ce.py",
       "console": "integratedTerminal",
       "args": [
-            // "--epochs", "1", 
-            // "--batch_size", "128"
+            "--data_folder", "./data/can-ml/can-ml/2017-subaru-forester/230726/preprocessed/rid4/TFRecord_w32_s16/", 
+            "--method", "1D-CNN-Modified-RetNet",
+            "--model", "win=32+stride=16",
+            "--window_size", "32",
+            "--stride", "16",
+
         ]
     }
   ]

@@ -159,7 +159,7 @@ def parse_option():
                     help='the number of RetNet retention layers in each block')
     parser.add_argument('--n_conv_layers', default=2, type=int,
                     help='the number of convolutional layers in tokenizer')
-    parser.add_argument('--positional_embedding', type=str, default='learnable',
+    parser.add_argument('--positional_embedding', type=str, default='none',
                         choices=['sine', 'learnable', 'none', 'sine_2d', 'learnable_2d'],
                         help='type of positional embedding')
 
