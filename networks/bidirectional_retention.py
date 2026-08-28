@@ -310,35 +310,4 @@ class BidirectionalRetentionEncoder(nn.Module):
         return x
 
 
-# --------------------------------------------------------------------------- #
-# Quick self-test
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    torch.manual_seed(0)
 
-    batch_size, seq_len, token_dim = 128, 32, 128
-    num_heads = 8
-    num_layers = 4
-
-    x = torch.randn(batch_size, seq_len, token_dim)
-
-    encoder = BidirectionalRetentionEncoder(
-        dim=token_dim,
-        num_heads=num_heads,
-        num_layers=num_layers,
-        dropout=0.1,
-    )
-
-    out = encoder(x)
-    print(f"Input shape:  {tuple(x.shape)}")
-    print(f"Output shape: {tuple(out.shape)}")
-    assert out.shape == x.shape, "output shape must match input shape"
-
-    # sanity check with a padding mask (e.g. shorter real sequences in a batch)
-    mask = torch.ones(batch_size, seq_len)
-    mask[:, 20:] = 0  # pretend last 12 tokens are padding for every sample
-    out_masked = encoder(x, attn_mask=mask)
-    print(f"Masked output shape: {tuple(out_masked.shape)}")
-
-    n_params = sum(p.numel() for p in encoder.parameters())
-    print(f"Total parameters: {n_params:,}")
