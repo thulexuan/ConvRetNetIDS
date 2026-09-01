@@ -49,6 +49,21 @@ class ConvRetNet(nn.Module):
             use_gated_decay=False,
             gated_decay_value_dim=16,
         ) # có swiGLU
+
+        # self.temporal_encoder = BidirectionalRetentionEncoder(
+        #     dim=d_model, num_heads=num_heads, num_layers=num_layers, dropout=0.1,
+        #     use_id_aware_decay=True, id_decay_delta=3.0,
+        # ) # có id-aware decay
+
+        # self.temporal_encoder = BidirectionalRetentionEncoder(
+        #     dim=d_model, num_heads=num_heads, num_layers=num_layers,
+        #     dropout=0.1, learnable_gamma=True, gamma_parameterization="sigmoid",
+        # ) # learnable gamma
+
+        # self.temporal_encoder = BidirectionalRetentionEncoder(
+        #     dim=d_model, num_heads=num_heads, num_layers=num_layers, dropout=0.1,
+        #     learnable_gamma=True, use_id_aware_decay=True, same_id_init_extra=0.9,
+        # ) # learnable gamma + id-aware decay
         
         self.final_ln = nn.LayerNorm(d_model)
 
@@ -67,11 +82,15 @@ class ConvRetNet(nn.Module):
         x: (B, T, 9) = [can_id, data0..7]
         """
 
+        id_features = x[:, :, 0]  # cột can_id
         id_payload_features = x[:, :, 0:9]  # cột can_id + data0..7 
 
         final_encode_feat = self.payload_local_encoder(id_payload_features) # (B, T, d_model)
 
         final_encode_feat = self.temporal_encoder(final_encode_feat)  # (B, T, d_model)
+
+        # id-aware
+        # final_encode_feat = self.temporal_encoder(final_encode_feat, can_ids=id_features)  # (B, T, d_model)
         final_encode_feat = self.final_ln(final_encode_feat)
 
         mean_pooled_feat = final_encode_feat.mean(dim=1)  # (B, d_model)
