@@ -353,7 +353,7 @@ def main():
     opt = parse_option()
     print(opt)
 
-    seed = 4
+    seed = 1
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)

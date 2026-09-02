@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from networks.attention_classifier import AttentionMILClassifier
 from networks.bidirectional_retention_with_swiGLU import BidirectionalRetentionEncoder
 from networks.payload_local_encoder_per_frame import PayloadLocalEncoderPerFrame
 from networks.original_retention_module import RetNetBlock, RetNetEncoder
@@ -67,15 +68,17 @@ class ConvRetNet(nn.Module):
         
         self.final_ln = nn.LayerNorm(d_model)
 
-        self.classifier = nn.Sequential(
-            nn.Linear(2 * d_model, d_model),
-            nn.ReLU(),
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
-            nn.ReLU(),
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, num_classes)
-        )
+        # self.classifier = nn.Sequential(
+        #     nn.Linear(2 * d_model, d_model),
+        #     nn.ReLU(),
+        #     nn.LayerNorm(d_model),
+        #     nn.Linear(d_model, d_model),
+        #     nn.ReLU(),
+        #     nn.LayerNorm(d_model),
+        #     nn.Linear(d_model, num_classes)
+        # )
+
+        self.classifier = AttentionMILClassifier(d_model, num_classes)
 
     def forward(self, x: torch.Tensor, mask=None) -> torch.Tensor:
         """
@@ -93,13 +96,17 @@ class ConvRetNet(nn.Module):
         # final_encode_feat = self.temporal_encoder(final_encode_feat, can_ids=id_features)  # (B, T, d_model)
         final_encode_feat = self.final_ln(final_encode_feat)
 
-        mean_pooled_feat = final_encode_feat.mean(dim=1)  # (B, d_model)
-        max_pooled_feat = final_encode_feat.max(dim=1).values  # (B, d_model)
+        # mean_pooled_feat = final_encode_feat.mean(dim=1)  # (B, d_model)
+        # max_pooled_feat = final_encode_feat.max(dim=1).values  # (B, d_model)
 
-        pooled_feat = torch.cat([mean_pooled_feat, max_pooled_feat], dim=1)  # (B, 2*d_model)
+        # pooled_feat = torch.cat([mean_pooled_feat, max_pooled_feat], dim=1)  # (B, 2*d_model)
 
-        logits = self.classifier(pooled_feat)  # (B, num_classes)
+        # logits = self.classifier(pooled_feat)  # (B, num_classes)
 
+        ##### attention classifier
+        dict = self.classifier(final_encode_feat)  # (B, num_classes)
+        logits = dict['logits'] 
+        
         return final_encode_feat, logits, None     
 
     
