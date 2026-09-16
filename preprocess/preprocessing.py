@@ -183,7 +183,7 @@ def load_attack_folder(filename: str, label, window_size=16, stride_size=16, ver
     return normalized
 
 def build_feature_col(df: pd.DataFrame) -> list:
-    """Lấy tên các cột feature (bỏ timestamp, attack, v.v.)."""
+    """Lấy tên các cột feature (bỏ timestamp, v.v.)."""
     return [c for c in df.columns if c not in ["timestamp", "attack"]]
 
 def sample_10pct(
@@ -211,7 +211,7 @@ def sample_10pct(
 
     return data_3d[chosen], labels[chosen]
 
-def run_pipeline(root_dir, output_dir, window_size=29, stride_size=15, feature_size=11, attacks=None) -> None:
+def run_pipeline(root_dir, output_dir, window_size=29, stride_size=15, feature_size=9, attacks=None) -> None:
 
     root   = Path(root_dir)
     outdir = Path(output_dir)
@@ -250,6 +250,9 @@ def run_pipeline(root_dir, output_dir, window_size=29, stride_size=15, feature_s
         }, index= range(len(l)))
 
         dft['label'] = dft['label'].apply(lambda x: (attack_id + 1) if any(x) else 0)
+
+        ### print final preprocessed dataframe
+        print(dft.head(10))
 
         print("Aggregating data: Done")
         print('#Normal: ', dft[dft['label'] == 0].shape[0])
@@ -303,7 +306,7 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_folder", default="./data/can-ml/can-ml/2017-subaru-forester/090726/merged", help="Root folder with attack subfolders")
-    parser.add_argument("--data_folder", default="./data/can-ml/can-ml/2017-subaru-forester/180826/preprocessed/", help="Root folder with attack subfolders")
+    parser.add_argument("--data_folder", default="./data/can-ml/can-ml/2017-subaru-forester/020926/preprocessed-keep-per-frame-label/", help="Root folder with attack subfolders")
     parser.add_argument("--window_size", type=int, default=32, help="window size")
     parser.add_argument("--stride_size", type=int, default=32, help="window stride")
     parser.add_argument("--rid", type=int, default=1, help="the number of rerun preprocessing")
@@ -314,11 +317,12 @@ if __name__ == '__main__':
     
     attack_types = ["combined", "DoS", "fuzzing", "gear", "interval", "rpm", 
                 "speed", "standstill", "systematic"]
+    chd_attack_types = ["DoS", "fuzzy", "gear", "rpm"]
     if args.stride_size is None:
         args.stride_size = args.window_size
         
     outdir =  args.data_folder + 'rid{}'.format(args.rid) + '/TFRecord_w{}_s{}'.format(args.window_size, args.stride_size)
-    run_pipeline(
+    run_pipeline( 
         root_dir    = args.root_folder,
         output_dir  = outdir,
         window_size = args.window_size,

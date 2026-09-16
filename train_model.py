@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import pprint
 from datetime import datetime
 from dataset import CANMLDataset
+from networks.attention_classifier import detect_attack_frames
 from networks.conv_retnet import ConvRetNet
 from util import AverageMeter
 from util import warmup_learning_rate
@@ -66,7 +67,7 @@ def parse_option():
     parser.add_argument('--classifier_optimizer', type=str, default='Adam')
     parser.add_argument('--optimizer', type=str, default='Adam')
     parser.add_argument('--dataset', type=str, default='CAN-ML',
-                        choices=['CAN-ML', 'CAN', 'ROAD'], 
+                        choices=['CAN-ML', 'CAN', 'ROAD', 'CHD', 'Survival'], 
                         help='dataset')
     parser.add_argument('--mean', type=str, 
                         help='mean of dataset in path in form of str tuple')
@@ -258,7 +259,7 @@ def train(train_loader, model, criterion_model, criterion_ce, optimizer, epoch, 
 
         warmup_learning_rate(opt, epoch, idx, len(train_loader), optimizer)
 
-        feats, logits, projected = model(images) # (128, 128), (128, 10), (128, 64)
+        feats, logits, projected, _ = model(images) # (128, 128), (128, 10), (128, 64)
         loss = criterion_model(logits, labels) 
         
         losses.update(loss.item(), bsz)
@@ -298,15 +299,17 @@ def validate(val_loader, model, criterion, opt):
     
     with torch.no_grad():
         for images, labels in tqdm(val_loader): 
-            images = images.to(opt.device, non_blocking=True)
+            images = images.to(opt.device, non_blocking=True) 
             labels = labels.to(opt.device, non_blocking=True)
+
+            frame_labels_batch = images[:, :, -1].long().cpu()  # (bsz, window_size)
            
-            feats, outputs, projected = model(images) 
+            feats, outputs, projected, attn_weights = model(images) 
             bsz = labels.size(0)
             loss = criterion(outputs, labels)
             losses.update(loss.item(), bsz)
             
-            pred = get_predict(outputs)
+            pred = get_predict(outputs) # đoán nhãn của window
 
             if isinstance(pred, torch.Tensor):
                 pred = pred.cpu().numpy()
@@ -324,6 +327,7 @@ def validate(val_loader, model, criterion, opt):
     conf_matrix = confusion_matrix(total_label, total_pred)
     accuracy = accuracy_score(total_label, total_pred)
     acc_percent = accuracy * 100 
+
     return losses.avg, f1, macro_f1, precision, recall, conf_matrix, acc_percent
 
 
@@ -401,6 +405,7 @@ def main():
         logger.add_scalar('macro_f1/val', macro_f1, step)
         val_losses.append(loss)
 
+        log_writer.write(f'Validation loss: {loss:.4f}\n')
         log_writer.write(f'Accuracy: {accuracy:.4f}\n')
         log_writer.write(f'F1 Score: {val_f1:.4f}\n')
         log_writer.write(f'Macro F1 Score: {macro_f1:.4f}\n')
