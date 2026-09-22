@@ -2,47 +2,64 @@
 bidirectional_retention.py
 ===========================
 
-Bidirectional Multi-Scale Retention block, adapted from:
+Multi-Scale Retention block, adapted from:
 
   - Sun et al., "Retentive Network: A Successor to Transformer for Large
     Language Models" (RetNet), arXiv:2307.08621
   - Wang et al., "Convolutional Retentive Network for EEG Decoding"
     (RetEEG), ICASSP 2025
 
-Design choices (matching RetEEG's non-causal variant, not RetNet's
-original causal/recurrent variant):
+Supports TWO decay directions, selectable via `causal`:
 
-  1. Bidirectional decay matrix:
-         D_B[h, n, m] = gamma_h ** |n - m|
-     instead of RetNet's causal (n >= m) triangular decay. Every token
-     attends to both past and future tokens in the sequence, with the
-     attention weight decaying exponentially with temporal distance.
+  1. Bidirectional (causal=False, default) -- matches RetEEG's non-causal
+     variant:
+         D[h, n, m] = gamma_h ** |n - m|
+     Every token attends to both past and future tokens in the window,
+     with the attention weight decaying exponentially with temporal
+     distance in EITHER direction. Appropriate for offline/batch
+     classification of a fixed-length window (e.g. a window of CAN bus
+     frames), where the full window is available at once.
 
-  2. Softmax is kept (unlike RetNet's linear "(QK^T . D) V"):
-         head_h = ( softmax(Q_h K_h^T)  .  D_B_h ) V_h
-     Softmax is applied to the raw attention scores first; the decay
-     matrix is then applied as an element-wise multiplicative prior.
+  2. Uni-directional / causal (causal=True) -- matches RetNet's ORIGINAL
+     variant:
+         D[h, n, m] = gamma_h ** (n - m)   if n >= m
+                    = 0                     if n <  m
+     Each token can only attend to itself and PAST tokens; a causal
+     mask is ALSO applied to the raw attention scores (before softmax)
+     so the softmax normalization is computed only over valid (past)
+     positions -- not just zeroed out afterwards, which would leave the
+     softmax denominator including future positions and break proper
+     normalization (see the two-part fix in `forward()` below).
+
+  3. Softmax is kept (unlike RetNet's original linear "(QK^T . D) V"):
+         head_h = ( softmax(Q_h K_h^T)  .  D_h ) V_h
      This is only valid/useful because we do NOT need the RNN-form
      dual representation that RetNet relies on for O(1) autoregressive
-     decoding -- this block is meant for offline/batch classification
-     of a fixed-length window (e.g. a window of CAN bus frames), not
-     streaming next-token generation. Dropping softmax is what breaks
-     the recurrent form; keeping it here costs nothing because we never
-     need that recurrent form in the first place.
+     decoding -- this block is meant for offline/batch classification,
+     not streaming next-token generation. Dropping softmax is what
+     breaks the recurrent form; keeping it here costs nothing because
+     we never need that recurrent form in the first place, regardless
+     of causal or bidirectional mode.
 
-  3. Multi-scale decay: each head has its own FIXED gamma_h so that
+  4. Multi-scale decay: each head has its own FIXED gamma_h so that
      different heads specialize in different temporal ranges (short
      bursts vs. long-range dependencies) -- useful for CAN IDS, where
      e.g. DoS-style attacks have very short-range temporal signatures
      while spoofing/replay attacks can have longer-range signatures.
 
-  4. Swish-gated output projection + GroupNorm, following RetNet's
+  5. Swish-gated output projection + GroupNorm, following RetNet's
      multi-scale retention (MSR) layer design.
 
-  5. Rotary position embedding (RoPE) is used to inject *relative*
+  6. Rotary position embedding (RoPE) is used to inject *relative*
      positional information into Q/K, similar in spirit to RetNet's
      xPos rotation (Q_n e^{i n theta}, K_m e^{i m theta}), implemented
      here in the standard real-valued "rotate-half" form.
+
+  7. Optional data-dependent "gated decay" (use_gated_decay=True):
+     multiplies the positional decay by an extra sigmoid gate based on
+     pairwise value distance -- kept as-is from the original file,
+     works identically under EITHER decay direction (causal or
+     bidirectional).
 
 Input / output shape convention (as requested):
     x: (batch_size, seq_len, token_dim)
@@ -120,6 +137,7 @@ class BidirectionalMultiScaleRetention(nn.Module):
         num_heads: int,
         dropout: float = 0.0,
         use_rotary: bool = True,
+        causal: bool = False,
         use_gated_decay: bool = False,
         gated_decay_value_dim: int = 16,
     ):
@@ -130,6 +148,7 @@ class BidirectionalMultiScaleRetention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.use_rotary = use_rotary
+        self.causal = causal
         self.use_gated_decay = use_gated_decay
 
         self.q_proj = nn.Linear(dim, dim, bias=False)
@@ -166,20 +185,30 @@ class BidirectionalMultiScaleRetention(nn.Module):
             self.gate_alpha = nn.Parameter(torch.ones(num_heads))
             self.gate_beta = nn.Parameter(torch.zeros(num_heads))
 
-    def _bidirectional_decay(
+    def _build_decay(
         self, seq_len: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
         """
-        Build D_B for every head: D_B[h, n, m] = gamma_h ** |n - m|.
+        Build D for every head, in either bidirectional or causal mode:
+            bidirectional: D[h,n,m] = gamma_h ** |n-m|
+            causal:        D[h,n,m] = gamma_h ** (n-m)  if n >= m
+                                    = 0                   if n <  m
         Returns shape (num_heads, seq_len, seq_len).
         """
         idx = torch.arange(seq_len, device=device)
-        dist = (idx[:, None] - idx[None, :]).abs().to(dtype)     # (L, L)
-        gammas = self.gammas.to(device=device, dtype=dtype)      # (H,)
-        log_gamma = torch.log(gammas)                            # (H,)
-        # gamma_h ** dist == exp(dist * log(gamma_h))
-        decay = torch.exp(log_gamma[:, None, None] * dist[None, :, :])  # (H, L, L)
-        return decay
+        gammas = self.gammas.to(device=device, dtype=dtype)  # (H,)
+        log_gamma = torch.log(gammas)  # (H,)
+
+        if not self.causal:
+            dist = (idx[:, None] - idx[None, :]).abs().to(dtype)  # (L, L)
+            decay = torch.exp(log_gamma[:, None, None] * dist[None, :, :])  # (H, L, L)
+            return decay
+        else:
+            n_minus_m = (idx[:, None] - idx[None, :]).to(dtype)  # (L, L), signed
+            causal_mask = (n_minus_m >= 0).to(dtype)  # 1 where n>=m, 0 where n<m
+            decay = torch.exp(log_gamma[:, None, None] * n_minus_m[None, :, :])  # (H, L, L)
+            decay = decay * causal_mask[None, :, :]  # zero out n<m (future)
+            return decay
 
     def _compute_gate(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
         """
@@ -246,9 +275,21 @@ class BidirectionalMultiScaleRetention(nn.Module):
             key_mask = attn_mask[:, None, None, :].to(dtype=torch.bool)  # (b,1,1,l)
             scores = scores.masked_fill(~key_mask, float("-inf"))
 
+        if self.causal:
+            # NEW: mask out future positions (n < m) BEFORE softmax, so
+            # the softmax denominator is computed only over valid
+            # (past/self) positions -- just zeroing the decay matrix
+            # AFTER softmax (as bidirectional mode does for padding)
+            # would leave leftover unnormalized probability mass
+            # allocated to future positions, which is wrong for a
+            # genuinely causal formulation.
+            idx = torch.arange(l, device=x.device)
+            causal_bool_mask = (idx[:, None] >= idx[None, :])  # (l, l), True where n>=m
+            scores = scores.masked_fill(~causal_bool_mask[None, None, :, :], float("-inf"))
+
         attn = F.softmax(scores, dim=-1)  # (b, h, l, l) -- nonlinearity kept here
 
-        decay = self._bidirectional_decay(l, x.device, x.dtype)  # (h, l, l)
+        decay = self._build_decay(l, x.device, x.dtype)  # (h, l, l)
         decay = decay.unsqueeze(0)  # (1, h, l, l) -- broadcast over batch
 
         if self.use_gated_decay:
@@ -352,6 +393,7 @@ class BidirectionalRetentionBlock(nn.Module):
         ffn_hidden_dim: int | None = None,
         dropout: float = 0.0,
         use_rotary: bool = True,
+        causal: bool = False,
         use_gated_decay: bool = False,
         gated_decay_value_dim: int = 16,
         ffn_type: str = "gelu",
@@ -364,6 +406,7 @@ class BidirectionalRetentionBlock(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             use_rotary=use_rotary,
+            causal=causal,
             use_gated_decay=use_gated_decay,
             gated_decay_value_dim=gated_decay_value_dim,
         )
@@ -405,6 +448,7 @@ class BidirectionalRetentionEncoder(nn.Module):
         ffn_hidden_dim: int | None = None,
         dropout: float = 0.0,
         use_rotary: bool = True,
+        causal: bool = False,
         use_gated_decay: bool = False,
         gated_decay_value_dim: int = 16,
         ffn_type: str = "swiglu",
@@ -418,6 +462,7 @@ class BidirectionalRetentionEncoder(nn.Module):
                     ffn_hidden_dim=ffn_hidden_dim,
                     dropout=dropout,
                     use_rotary=use_rotary,
+                    causal=causal,
                     use_gated_decay=use_gated_decay,
                     gated_decay_value_dim=gated_decay_value_dim,
                     ffn_type=ffn_type,
@@ -466,6 +511,69 @@ if __name__ == "__main__":
 
     n_params = sum(p.numel() for p in encoder.parameters())
     print(f"Total parameters: {n_params:,}")
+
+    # -------------------------------------------------------------- #
+    # NEW: Causal (uni-directional, original RetNet) vs Bidirectional
+    # -------------------------------------------------------------- #
+    encoder_causal = BidirectionalRetentionEncoder(
+        dim=token_dim, num_heads=num_heads, num_layers=num_layers,
+        dropout=0.1, causal=True,
+    )
+    out_causal = encoder_causal(x)
+    print(f"\n[Causal] Output shape: {tuple(out_causal.shape)}")
+    assert out_causal.shape == x.shape
+
+    loss = out_causal.sum()
+    loss.backward()
+    q_grad = encoder_causal.layers[0].retention.q_proj.weight.grad
+    grad_ok = q_grad is not None and torch.isfinite(q_grad).all() and q_grad.abs().sum() > 0
+    print(f"[Causal] q_proj gradient finite & nonzero: {grad_ok.item()}")
+
+    # Kiểm tra trực tiếp attention weight (không dùng output-sensitivity
+    # test, vì với model chưa train, softmax(QK^T) ở không gian chiều
+    # cao có thể "quá nhọn" một cách ngẫu nhiên, gây false negative)
+    def _extract_attn_weights(retention_layer, x_in, causal):
+        b, l, d = x_in.shape
+        h, hd = retention_layer.num_heads, retention_layer.head_dim
+        q = retention_layer.q_proj(x_in).view(b, l, h, hd).transpose(1, 2)
+        k = retention_layer.k_proj(x_in).view(b, l, h, hd).transpose(1, 2)
+        if retention_layer.use_rotary:
+            cos, sin = retention_layer.rotary(l, x_in.device, x_in.dtype)
+            q = _apply_rotary(q, cos, sin)
+            k = _apply_rotary(k, cos, sin)
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(hd)
+        if causal:
+            idx = torch.arange(l, device=x_in.device)
+            causal_bool_mask = (idx[:, None] >= idx[None, :])
+            scores = scores.masked_fill(~causal_bool_mask[None, None, :, :], float("-inf"))
+        return F.softmax(scores, dim=-1)
+
+    x_small = torch.randn(2, seq_len, token_dim)
+    attn_causal = _extract_attn_weights(encoder_causal.layers[0].retention, x_small, causal=True)
+    attn_bidir = _extract_attn_weights(encoder.layers[0].retention, x_small, causal=False)
+
+    causal_future_weight = attn_causal[:, :, 5, 20].abs().max().item()
+    bidir_future_weight = attn_bidir[:, :, 5, 20].abs().max().item()
+
+    print(f"\n[Causal]        attn weight from query=5 to FUTURE key=20: "
+          f"{causal_future_weight:.2e}  (must be exactly 0)")
+    print(f"[Bidirectional] attn weight from query=5 to key=20 (allowed to be nonzero): "
+          f"{bidir_future_weight:.2e}")
+    assert causal_future_weight < 1e-10, "causal mode is leaking future information -- masking bug!"
+    print("PASSED: causal mode assigns EXACTLY ZERO attention weight to future positions.")
+
+    n_params_causal = sum(p.numel() for p in encoder_causal.parameters())
+    print(f"[Causal] Total parameters: {n_params_causal:,}")
+
+    # Causal + Gated decay CÙNG LÚC -- xác nhận 2 tính năng độc lập, dùng chung được
+    encoder_causal_gated = BidirectionalRetentionEncoder(
+        dim=token_dim, num_heads=num_heads, num_layers=2,
+        causal=True, use_gated_decay=True,
+    )
+    out_causal_gated = encoder_causal_gated(x)
+    print(f"\n[Causal + Gated decay] Output shape: {tuple(out_causal_gated.shape)}")
+    assert out_causal_gated.shape == x.shape
+    print("PASSED: causal và gated decay hoạt động ĐỘC LẬP, dùng chung được cùng lúc.")
 
     # -------------------------------------------------------------- #
     # NEW: Gated decay

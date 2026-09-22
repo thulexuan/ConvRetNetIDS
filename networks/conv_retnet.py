@@ -4,6 +4,7 @@ import torch.nn.functional as F
 
 from networks.bidirectional_retention_with_swiGLU import BidirectionalRetentionEncoder
 from networks.payload_local_encoder_per_frame import PayloadLocalEncoderPerFrame
+# from networks.softmax_retention_encoder import BidirectionalRetentionEncoder
 
 class ConvRetNet(nn.Module):
 
@@ -24,6 +25,8 @@ class ConvRetNet(nn.Module):
         self.num_features = num_features
         self.d_model = d_model
         self.window_size = window_size  # số frame trong mỗi window (T=window_size) - cố định, không thay đổi
+
+        # self.linear = nn.Linear(num_features, d_model)
 
         self.payload_local_encoder = PayloadLocalEncoderPerFrame(
             in_channels=9,  # can_id + 8 byte payload 
@@ -47,11 +50,14 @@ class ConvRetNet(nn.Module):
             dropout=dropout,
             use_gated_decay=False,
             gated_decay_value_dim=16,
+            # causal=True,
+            ffn_type="swiglu"
         ) # có swiGLU
 
         # self.temporal_encoder = BidirectionalRetentionEncoder(
         #     dim=d_model, num_heads=num_heads, num_layers=num_layers,
         #     dropout=dropout, causal=True, # causal=False~bidirectional, causal=True~unidirectional
+        #     ffn_type="gelu"
         # )
 
         # self.temporal_encoder = BidirectionalRetentionEncoder(
@@ -97,6 +103,10 @@ class ConvRetNet(nn.Module):
         id_payload_features = x[:, :, 0:9]  # cột can_id + data0..7 
 
         final_encode_feat = self.payload_local_encoder(id_payload_features) # (B, T, d_model)
+
+
+        # simple Linear first
+        # final_encode_feat = self.linear(id_payload_features)  # (B, T, d_model)
 
         final_encode_feat = self.temporal_encoder(final_encode_feat)  # (B, T, d_model)
 

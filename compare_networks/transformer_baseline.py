@@ -54,6 +54,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from networks.bidirectional_retention_with_swiGLU import SwiGLUFeedForward
+
 
 # --------------------------------------------------------------------------- #
 # Standard sinusoidal positional encoding (Vaswani et al. 2017)
@@ -149,11 +151,14 @@ class TransformerEncoderBlock(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
 
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, ff_dim),
-            nn.GELU(),
-            nn.Linear(ff_dim, d_model),
-        )
+        # self.ffn = nn.Sequential(
+        #     nn.Linear(d_model, ff_dim),
+        #     nn.GELU(),
+        #     nn.Linear(ff_dim, d_model),
+        # )
+
+        self.ffn = SwiGLUFeedForward(d_model, hidden_dim=None, dropout=dropout)
+
         self.norm2 = nn.LayerNorm(d_model)
         self.dropout2 = nn.Dropout(dropout)
 
