@@ -186,7 +186,7 @@ def build_feature_col(df: pd.DataFrame) -> list:
     """Lấy tên các cột feature (bỏ timestamp, v.v.)."""
     return [c for c in df.columns if c not in ["timestamp", "attack"]]
 
-def sample_10pct(
+def sample_20pct(
     data_3d  : np.ndarray,
     labels   : np.ndarray,
     attack_id: int,
@@ -223,8 +223,13 @@ def run_pipeline(root_dir, output_dir, window_size=29, stride_size=15, feature_s
 
     xtrain = np.empty((0, window_size, feature_size))
     ytrain = np.empty((0))
+    xval = np.empty((0, window_size, feature_size))
+    yval = np.empty((0))
     xtest = np.empty((0, window_size, feature_size))
     ytest = np.empty((0))
+
+    xval = np.empty((0, window_size, feature_size))
+    yval = np.empty((0))
 
     for attack_id, attack in enumerate(attacks):
         print('Attack: {} ==============='.format(attack))
@@ -267,10 +272,11 @@ def run_pipeline(root_dir, output_dir, window_size=29, stride_size=15, feature_s
 
         print("data_3d.len:", len(data_3d), "labels_cur.len:", len(labels_cur))
 
-        # sample 10% of attack windows and 10% of normal windows
-        data_3d, labels_cur = sample_10pct(data_3d, labels_cur, attack_id + 1, seed=42)
 
-        print("after sampling 10%, data_3d.len:", len(data_3d), "labels_cur.len:", len(labels_cur))
+        # sample 20% of attack windows and 20% of normal windows
+        data_3d, labels_cur = sample_20pct(data_3d, labels_cur, attack_id + 1, seed=42)
+
+        print("after sampling 20%, data_3d.len:", len(data_3d), "labels_cur.len:", len(labels_cur))
 
         attack_idx = np.where(labels_cur != 0)[0] # idx of attack windows
         benign_idx = np.where(labels_cur == 0)[0] # idx of benign windows
@@ -280,33 +286,67 @@ def run_pipeline(root_dir, output_dir, window_size=29, stride_size=15, feature_s
         # chia train/test của benign windows
         data_train_b, data_test_b, labels_train_b, labels_test_b = train_test_split(data_3d[benign_idx], labels_cur[benign_idx], test_size=0.2, random_state=42, shuffle=True)
 
+        # valdiation set
+        data_test_a, data_val_a, labels_test_a, labels_val_a = train_test_split(data_test_a, labels_test_a, test_size=0.5, random_state=42, shuffle=True)
+        data_test_b, data_val_b, labels_test_b, labels_val_b = train_test_split(data_test_b, labels_test_b, test_size=0.5, random_state=42, shuffle=True)
+        
+        
         data_train = np.concatenate((data_train_a, data_train_b))
         data_test = np.concatenate((data_test_a, data_test_b))
         labels_train = np.concatenate((labels_train_a, labels_train_b))
         labels_test = np.concatenate((labels_test_a, labels_test_b))
 
+        data_val = np.concatenate((data_val_a, data_val_b))
+        labels_val = np.concatenate((labels_val_a, labels_val_b))
+
         xtrain = np.concatenate((xtrain, data_train))
         ytrain = np.concatenate((ytrain, labels_train))
+
         xtest = np.concatenate((xtest, data_test))
         ytest = np.concatenate((ytest, labels_test))
+        
+        xval = np.concatenate((xval, data_val))
+        yval = np.concatenate((yval, labels_val))
 
         print("Adding data of attack {} to train/test sets: Done".format(attack))
+        # print("xtrain.len:", len(xtrain), "ytrain.len:", len(ytrain))
+        # print("xtest.len:", len(xtest), "ytest.len:", len(ytest))
+        # print("xval.len:", len(xval), "yval.len:", len(yval))
 
+    # total normal and attack windows over all attack files
+    n_train_normal = int((ytrain == 0).sum())
+    n_train_attack = int((ytrain != 0).sum())
+    n_test_normal  = int((ytest == 0).sum())
+    n_test_attack  = int((ytest != 0).sum())
+
+    print("\nTotal windows")
+    print(f"  {'':8s} {'train':>8s} {'test':>8s} {'total':>8s}")
+    print(f"  {'normal':8s} {n_train_normal:8,d} {n_test_normal:8,d} "
+            f"{n_train_normal + n_test_normal:8,d}")
+    print(f"  {'attack':8s} {n_train_attack:8,d} {n_test_attack:8,d} "
+            f"{n_train_attack + n_test_attack:8,d}")
+    print(f"  {'total':8s} {len(ytrain):8,d} {len(ytest):8,d} "
+            f"{len(ytrain) + len(ytest):8,d}")
+    
     np.save(os.path.join(output_dir, f"xtrain-{window_size}-{stride_size}.npy"), xtrain)
     np.save(os.path.join(output_dir, f"ytrain-{window_size}-{stride_size}.npy"), ytrain) 
     
     np.save(os.path.join(output_dir, f"xtest-{window_size}-{stride_size}.npy"), xtest)
     np.save(os.path.join(output_dir, f"ytest-{window_size}-{stride_size}.npy"), ytest)
+
+    np.save(os.path.join(output_dir, f"xval-{window_size}-{stride_size}.npy"), xval)
+    np.save(os.path.join(output_dir, f"yval-{window_size}-{stride_size}.npy"), yval)
     print("DONE PROCESS") 
 
-    return xtrain, xtest, ytrain, ytest
+    return xtrain, xtest, ytrain, ytest, xval, yval
 
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_folder", default="./data/can-ml/can-ml/2017-subaru-forester/090726/merged", help="Root folder with attack subfolders")
-    parser.add_argument("--data_folder", default="./data/can-ml/can-ml/2017-subaru-forester/020926/preprocessed-keep-per-frame-label/", help="Root folder with attack subfolders")
+    # parser.add_argument("--data_folder", default="./data/can-ml/can-ml/2017-subaru-forester/020926/preprocessed-keep-per-frame-label/", help="Root folder with attack subfolders")
+    parser.add_argument("--data_folder", default="./data/can-ml/can-ml/2017-subaru-forester/04-11-26/preprocessed/", help="Root folder with attack subfolders")
     parser.add_argument("--window_size", type=int, default=32, help="window size")
     parser.add_argument("--stride_size", type=int, default=32, help="window stride")
     parser.add_argument("--rid", type=int, default=1, help="the number of rerun preprocessing")
@@ -321,7 +361,7 @@ if __name__ == '__main__':
     if args.stride_size is None:
         args.stride_size = args.window_size
         
-    outdir =  args.data_folder + 'rid{}'.format(args.rid) + '/TFRecord_w{}_s{}'.format(args.window_size, args.stride_size)
+    outdir =  args.data_folder + 'rid{}'.format(args.rid) 
     run_pipeline( 
         root_dir    = args.root_folder,
         output_dir  = outdir,

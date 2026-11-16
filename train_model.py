@@ -92,7 +92,7 @@ def parse_option():
     parser.add_argument('--early_stop_patience', type=int, default=20,
                         help='patience for early stopping')
     # model parameters 
-    parser.add_argument('--embedding_dim', type=int, default=128,
+    parser.add_argument('--embedding_dim', type=int, default=64,
                         help='dimension of the embedding layer')
     parser.add_argument('--projection_dim', type=int, default=64,
                         help='dimension of the projection layer to train feature space')
@@ -104,6 +104,10 @@ def parse_option():
                         help='size of the sliding window')
     parser.add_argument('--stride_size', type=int, default=32,
                         help='size of the stride for the sliding window')
+    parser.add_argument('--kernel_size', type=int, default=1,
+                        help='size of the kernel for the convolutional layer')
+    parser.add_argument('--n_res_blocks', type=int, default=2,
+                        help='number of residual blocks')
 
     # settings for RetNet config
     parser.add_argument('--n_layers', default=2, type=int,
@@ -161,14 +165,20 @@ def set_loader(opt):
     test_dataset = CANMLDataset(
         root_dir=opt.data_folder, window_size=opt.window_size, stride_size=opt.stride_size, is_train=False, is_test=True)
 
+    val_dataset = CANMLDataset(
+            root_dir=opt.data_folder, window_size=opt.window_size, stride_size=opt.stride_size, is_train=False, is_test=True)
+
+    val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=opt.batch_size, shuffle=False, pin_memory=True)
+
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers, pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=opt.batch_size, shuffle=False, pin_memory=True)
     train_classifier_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opt.batch_size, shuffle=True, num_workers=opt.num_workers, pin_memory=True)
 
     print('Number of training samples: {}'.format(len(train_dataset)))
     print('Number of testing samples: {}'.format(len(test_dataset)))
+    print('Number of validating samples: {}'.format(len(val_dataset)))
    
-    return train_loader, test_loader, train_classifier_loader, len(train_dataset)
+    return train_loader, test_loader, val_loader, train_classifier_loader, len(train_dataset)
 
 def set_model(opt):
     torch.cuda.empty_cache()
@@ -184,6 +194,8 @@ def set_model(opt):
                 ffn_dim=opt.embedding_dim * 2,
                 num_classes=opt.n_classes,
                 dropout=0.1,
+                kernel_size=opt.kernel_size,
+                n_res_blocks=opt.n_res_blocks
             )
 
     criterion_model = torch.nn.CrossEntropyLoss()
@@ -301,8 +313,6 @@ def validate(val_loader, model, criterion, opt):
         for images, labels in tqdm(val_loader): 
             images = images.to(opt.device, non_blocking=True) 
             labels = labels.to(opt.device, non_blocking=True)
-
-            frame_labels_batch = images[:, :, -1].long().cpu()  # (bsz, window_size)
            
             feats, outputs, projected, attn_weights = model(images) 
             bsz = labels.size(0)
@@ -322,8 +332,8 @@ def validate(val_loader, model, criterion, opt):
     
     f1 = f1_score(total_label, total_pred, average='weighted')
     macro_f1 = f1_score(total_label, total_pred, average='macro')
-    precision = precision_score(total_label, total_pred, average='weighted', zero_division=0)
-    recall = recall_score(total_label, total_pred, average='weighted')
+    precision = precision_score(total_label, total_pred, average='macro', zero_division=0)
+    recall = recall_score(total_label, total_pred, average='macro')
     conf_matrix = confusion_matrix(total_label, total_pred)
     accuracy = accuracy_score(total_label, total_pred)
     acc_percent = accuracy * 100 
@@ -357,13 +367,13 @@ def main():
     opt = parse_option()
     print(opt)
 
-    seed = 1
+    seed = 2
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
     # build data loader
-    train_loader, test_loader, train_classifier_loader, num_of_training_samples = set_loader(opt)
+    train_loader, test_loader, val_loader, train_classifier_loader, num_of_training_samples = set_loader(opt)
     model, criterion_model, criterion_ce = set_model(opt)
 
     # build optimizer
@@ -398,7 +408,7 @@ def main():
         train_losses.append(train_loss)
         print('Train Losses:', train_losses)
 
-        loss, val_f1, macro_f1, precision, recall, conf_matrix, accuracy = validate(test_loader, model, criterion_ce, opt)
+        loss, val_f1, macro_f1, precision, recall, conf_matrix, accuracy = validate(val_loader, model, criterion_ce, opt)
         logger.add_scalar('loss_ce/val', loss, step)
         logger.add_scalar('acc/val', accuracy, step)
         logger.add_scalar('val_f1/val', val_f1, step)
@@ -427,7 +437,6 @@ def main():
 
         step = new_step
         # Save checkpoint 
-      
         if epoch % opt.save_freq == 0:
             model_save_file = os.path.join(opt.save_folder, f'ckpt_epoch_{epoch}.pth')
             save_model(model, optimizer, opt, epoch, model_save_file)

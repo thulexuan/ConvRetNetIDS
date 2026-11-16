@@ -138,18 +138,15 @@ class BidirectionalMultiScaleRetention(nn.Module):
         dropout: float = 0.0,
         use_rotary: bool = True,
         causal: bool = False,
-        use_gated_decay: bool = False,
-        gated_decay_value_dim: int = 16,
     ):
         super().__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
 
         self.dim = dim
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        self.head_dim = dim // num_heads  # dim of each head
         self.use_rotary = use_rotary
         self.causal = causal
-        self.use_gated_decay = use_gated_decay
 
         self.q_proj = nn.Linear(dim, dim, bias=False)
         self.k_proj = nn.Linear(dim, dim, bias=False)
@@ -170,20 +167,6 @@ class BidirectionalMultiScaleRetention(nn.Module):
         # Fixed (non-learnable) multi-scale decay rates: gamma_h = 1 - 2^(-5-h)
         gammas = 1.0 - torch.pow(2.0, -5.0 - torch.arange(num_heads).float())
         self.register_buffer("gammas", gammas)  # shape: (num_heads,)
-
-        if use_gated_decay:
-            # NEW: independent projection (NOT shared with q/k/v_proj)
-            # used only to measure pairwise "value distance" between
-            # frames, for data-dependent (gated) decay. Kept small
-            # (gated_decay_value_dim << dim) so it is forced to distill
-            # mainly magnitude/value information rather than the full
-            # mixed representation in `x`.
-            self.value_head = nn.Linear(dim, gated_decay_value_dim, bias=False)
-            # NEW: per-head learnable gate sensitivity (alpha) and
-            # threshold/offset (beta):
-            #   gate[b,h,n,m] = sigmoid( -alpha_h * delta[b,n,m] + beta_h )
-            self.gate_alpha = nn.Parameter(torch.ones(num_heads))
-            self.gate_beta = nn.Parameter(torch.zeros(num_heads))
 
     def _build_decay(
         self, seq_len: int, device: torch.device, dtype: torch.dtype
@@ -209,42 +192,6 @@ class BidirectionalMultiScaleRetention(nn.Module):
             decay = torch.exp(log_gamma[:, None, None] * n_minus_m[None, :, :])  # (H, L, L)
             decay = decay * causal_mask[None, :, :]  # zero out n<m (future)
             return decay
-
-    def _compute_gate(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """
-        NEW (gated decay): data-dependent gate that down-weights decay
-        between frames whose learned "value embedding" differs a lot
-        -- e.g. a physically implausible jump in a spoofed signal.
-
-            v            = value_head(x)                     (b, L, value_dim)
-            delta[n,m]   = || v_n - v_m ||                    (b, L, L)
-            gate_h[n,m]  = sigmoid( -alpha_h * delta[n,m] + beta_h )
-
-        Returns: (batch, num_heads, L, L) gate in (0, 1).
-        """
-        v = self.value_head(x)  # (b, L, value_dim)
-
-        # pairwise squared distance via ||a-b||^2 = ||a||^2+||b||^2-2a.b,
-        # computed with a single matmul instead of an O(L^2) python loop.
-        sq_norm = (v**2).sum(dim=-1)  # (b, L)
-        delta_sq = (
-            sq_norm[:, :, None]
-            + sq_norm[:, None, :]
-            - 2 * torch.matmul(v, v.transpose(-1, -2))
-        )  # (b, L, L)
-        # +eps INSIDE sqrt is essential: sqrt's gradient is 1/(2*sqrt(x)),
-        # which is +inf at x=0 (delta_sq[n,n]=0 exactly); clamping alone
-        # still produces NaN gradients, the +eps keeps them finite.
-        delta = torch.sqrt(torch.clamp(delta_sq, min=0.0) + 1e-8)  # (b, L, L)
-
-        alpha = self.gate_alpha.to(device=x.device, dtype=x.dtype)  # (H,)
-        beta = self.gate_beta.to(device=x.device, dtype=x.dtype)  # (H,)
-
-        gate = torch.sigmoid(
-            -alpha[None, :, None, None] * delta[:, None, :, :]
-            + beta[None, :, None, None]
-        )  # (b, H, L, L)
-        return gate
 
     def forward(
         self, x: torch.Tensor, attn_mask: torch.Tensor | None = None
@@ -292,15 +239,6 @@ class BidirectionalMultiScaleRetention(nn.Module):
         decay = self._build_decay(l, x.device, x.dtype)  # (h, l, l)
         decay = decay.unsqueeze(0)  # (1, h, l, l) -- broadcast over batch
 
-        if self.use_gated_decay:
-            # NEW: multiply the fixed positional decay by a
-            # data-dependent gate -- the base decay stays exactly as
-            # before, this just adds an extra multiplicative factor
-            # that can push decay towards 0 when the frames' learned
-            # "value embeddings" differ a lot.
-            gate = self._compute_gate(x, l)  # (b, h, l, l)
-            decay = decay * gate  # -> (b, h, l, l)
-
         attn = attn * decay  # broadcasts (1,h,l,l) or matches (b,h,l,l)
         attn = self.dropout(attn)
 
@@ -316,9 +254,6 @@ class BidirectionalMultiScaleRetention(nn.Module):
         return out
 
 
-# --------------------------------------------------------------------------- #
-# Feed-forward network
-# --------------------------------------------------------------------------- #
 class FeedForward(nn.Module):
     """Original GELU-MLP feed-forward: Linear -> GELU -> Dropout -> Linear."""
 
@@ -326,7 +261,8 @@ class FeedForward(nn.Module):
         super().__init__()
         # RetNet doubles the FFN intermediate dim (2d) to keep parameter
         # count comparable to a standard Transformer block after widening V.
-        hidden_dim = hidden_dim or dim * 2
+        # hidden_dim = hidden_dim or dim * 2
+        hidden_dim = hidden_dim or int(dim * 2)
         self.net = nn.Sequential(
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
@@ -337,10 +273,6 @@ class FeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
-
-# --------------------------------------------------------------------------- #
-# NEW: SwiGLU feed-forward (gated FFN, as used in LLaMA/PaLM/Mistral)
-# --------------------------------------------------------------------------- #
 class SwiGLUFeedForward(nn.Module):
     """
     Gated feed-forward: two parallel projections instead of one.
@@ -391,12 +323,10 @@ class BidirectionalRetentionBlock(nn.Module):
         dim: int,
         num_heads: int,
         ffn_hidden_dim: int | None = None,
-        dropout: float = 0.0,
+        dropout: float = 0.1,
         use_rotary: bool = True,
         causal: bool = False,
-        use_gated_decay: bool = False,
-        gated_decay_value_dim: int = 16,
-        ffn_type: str = "gelu",
+        ffn_type: str = "swiglu",
     ):
         super().__init__()
         assert ffn_type in ("gelu", "swiglu"), "ffn_type must be 'gelu' or 'swiglu'"
@@ -407,8 +337,6 @@ class BidirectionalRetentionBlock(nn.Module):
             dropout=dropout,
             use_rotary=use_rotary,
             causal=causal,
-            use_gated_decay=use_gated_decay,
-            gated_decay_value_dim=gated_decay_value_dim,
         )
         self.norm2 = nn.LayerNorm(dim)
         # NEW: choose between the original GELU-MLP and SwiGLU FFN.
@@ -424,11 +352,6 @@ class BidirectionalRetentionBlock(nn.Module):
         out = self.ffn(self.norm2(y)) + y
         return out
 
-
-# --------------------------------------------------------------------------- #
-# Stack of blocks -- drop-in temporal encoder, e.g. after a CNN front-end
-# in a CAN-bus intrusion detection pipeline.
-# --------------------------------------------------------------------------- #
 class BidirectionalRetentionEncoder(nn.Module):
     """
     Stack of BidirectionalRetentionBlock layers.
@@ -449,8 +372,6 @@ class BidirectionalRetentionEncoder(nn.Module):
         dropout: float = 0.0,
         use_rotary: bool = True,
         causal: bool = False,
-        use_gated_decay: bool = False,
-        gated_decay_value_dim: int = 16,
         ffn_type: str = "swiglu",
     ):
         super().__init__()
@@ -463,8 +384,6 @@ class BidirectionalRetentionEncoder(nn.Module):
                     dropout=dropout,
                     use_rotary=use_rotary,
                     causal=causal,
-                    use_gated_decay=use_gated_decay,
-                    gated_decay_value_dim=gated_decay_value_dim,
                     ffn_type=ffn_type,
                 )
                 for _ in range(num_layers)
@@ -477,161 +396,3 @@ class BidirectionalRetentionEncoder(nn.Module):
         for layer in self.layers:
             x = layer(x, attn_mask=attn_mask)
         return x
-
-
-# --------------------------------------------------------------------------- #
-# Quick self-test
-# --------------------------------------------------------------------------- #
-if __name__ == "__main__":
-    torch.manual_seed(0)
-
-    batch_size, seq_len, token_dim = 128, 32, 128
-    num_heads = 8
-    num_layers = 4
-
-    x = torch.randn(batch_size, seq_len, token_dim)
-
-    encoder = BidirectionalRetentionEncoder(
-        dim=token_dim,
-        num_heads=num_heads,
-        num_layers=num_layers,
-        dropout=0.1,
-    )
-
-    out = encoder(x)
-    print(f"Input shape:  {tuple(x.shape)}")
-    print(f"Output shape: {tuple(out.shape)}")
-    assert out.shape == x.shape, "output shape must match input shape"
-
-    # sanity check with a padding mask (e.g. shorter real sequences in a batch)
-    mask = torch.ones(batch_size, seq_len)
-    mask[:, 20:] = 0  # pretend last 12 tokens are padding for every sample
-    out_masked = encoder(x, attn_mask=mask)
-    print(f"Masked output shape: {tuple(out_masked.shape)}")
-
-    n_params = sum(p.numel() for p in encoder.parameters())
-    print(f"Total parameters: {n_params:,}")
-
-    # -------------------------------------------------------------- #
-    # NEW: Causal (uni-directional, original RetNet) vs Bidirectional
-    # -------------------------------------------------------------- #
-    encoder_causal = BidirectionalRetentionEncoder(
-        dim=token_dim, num_heads=num_heads, num_layers=num_layers,
-        dropout=0.1, causal=True,
-    )
-    out_causal = encoder_causal(x)
-    print(f"\n[Causal] Output shape: {tuple(out_causal.shape)}")
-    assert out_causal.shape == x.shape
-
-    loss = out_causal.sum()
-    loss.backward()
-    q_grad = encoder_causal.layers[0].retention.q_proj.weight.grad
-    grad_ok = q_grad is not None and torch.isfinite(q_grad).all() and q_grad.abs().sum() > 0
-    print(f"[Causal] q_proj gradient finite & nonzero: {grad_ok.item()}")
-
-    # Kiểm tra trực tiếp attention weight (không dùng output-sensitivity
-    # test, vì với model chưa train, softmax(QK^T) ở không gian chiều
-    # cao có thể "quá nhọn" một cách ngẫu nhiên, gây false negative)
-    def _extract_attn_weights(retention_layer, x_in, causal):
-        b, l, d = x_in.shape
-        h, hd = retention_layer.num_heads, retention_layer.head_dim
-        q = retention_layer.q_proj(x_in).view(b, l, h, hd).transpose(1, 2)
-        k = retention_layer.k_proj(x_in).view(b, l, h, hd).transpose(1, 2)
-        if retention_layer.use_rotary:
-            cos, sin = retention_layer.rotary(l, x_in.device, x_in.dtype)
-            q = _apply_rotary(q, cos, sin)
-            k = _apply_rotary(k, cos, sin)
-        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(hd)
-        if causal:
-            idx = torch.arange(l, device=x_in.device)
-            causal_bool_mask = (idx[:, None] >= idx[None, :])
-            scores = scores.masked_fill(~causal_bool_mask[None, None, :, :], float("-inf"))
-        return F.softmax(scores, dim=-1)
-
-    x_small = torch.randn(2, seq_len, token_dim)
-    attn_causal = _extract_attn_weights(encoder_causal.layers[0].retention, x_small, causal=True)
-    attn_bidir = _extract_attn_weights(encoder.layers[0].retention, x_small, causal=False)
-
-    causal_future_weight = attn_causal[:, :, 5, 20].abs().max().item()
-    bidir_future_weight = attn_bidir[:, :, 5, 20].abs().max().item()
-
-    print(f"\n[Causal]        attn weight from query=5 to FUTURE key=20: "
-          f"{causal_future_weight:.2e}  (must be exactly 0)")
-    print(f"[Bidirectional] attn weight from query=5 to key=20 (allowed to be nonzero): "
-          f"{bidir_future_weight:.2e}")
-    assert causal_future_weight < 1e-10, "causal mode is leaking future information -- masking bug!"
-    print("PASSED: causal mode assigns EXACTLY ZERO attention weight to future positions.")
-
-    n_params_causal = sum(p.numel() for p in encoder_causal.parameters())
-    print(f"[Causal] Total parameters: {n_params_causal:,}")
-
-    # Causal + Gated decay CÙNG LÚC -- xác nhận 2 tính năng độc lập, dùng chung được
-    encoder_causal_gated = BidirectionalRetentionEncoder(
-        dim=token_dim, num_heads=num_heads, num_layers=2,
-        causal=True, use_gated_decay=True,
-    )
-    out_causal_gated = encoder_causal_gated(x)
-    print(f"\n[Causal + Gated decay] Output shape: {tuple(out_causal_gated.shape)}")
-    assert out_causal_gated.shape == x.shape
-    print("PASSED: causal và gated decay hoạt động ĐỘC LẬP, dùng chung được cùng lúc.")
-
-    # -------------------------------------------------------------- #
-    # NEW: Gated decay
-    # -------------------------------------------------------------- #
-    gated_encoder = BidirectionalRetentionEncoder(
-        dim=token_dim,
-        num_heads=num_heads,
-        num_layers=num_layers,
-        dropout=0.1,
-        use_gated_decay=True,
-        gated_decay_value_dim=16,
-    )
-    out_gated = gated_encoder(x)
-    print(f"\n[Gated decay] Output shape: {tuple(out_gated.shape)}")
-    assert out_gated.shape == x.shape
-
-    loss = out_gated.sum()
-    loss.backward()
-    vh_grad = gated_encoder.layers[0].retention.value_head.weight.grad
-    grad_ok = vh_grad is not None and torch.isfinite(vh_grad).all() and vh_grad.abs().sum() > 0
-    print(f"[Gated decay] value_head gradient finite & nonzero: {grad_ok.item()}")
-
-    n_params_gated = sum(p.numel() for p in gated_encoder.parameters())
-    print(f"[Gated decay] Total parameters: {n_params_gated:,}")
-
-    # -------------------------------------------------------------- #
-    # NEW: SwiGLU FFN (vs. default GELU-MLP FFN)
-    # -------------------------------------------------------------- #
-    encoder_gelu = BidirectionalRetentionEncoder(
-        dim=token_dim, num_heads=num_heads, num_layers=num_layers,
-        dropout=0.1, ffn_type="gelu",
-    )
-    encoder_swiglu = BidirectionalRetentionEncoder(
-        dim=token_dim, num_heads=num_heads, num_layers=num_layers,
-        dropout=0.1, ffn_type="swiglu",
-    )
-
-    out_gelu = encoder_gelu(x)
-    out_swiglu = encoder_swiglu(x)
-    print(f"\n[GELU-MLP FFN]  Output shape: {tuple(out_gelu.shape)}")
-    print(f"[SwiGLU FFN]    Output shape: {tuple(out_swiglu.shape)}")
-    assert out_gelu.shape == x.shape
-    assert out_swiglu.shape == x.shape
-
-    n_params_gelu = sum(p.numel() for p in encoder_gelu.parameters())
-    n_params_swiglu = sum(p.numel() for p in encoder_swiglu.parameters())
-    print(f"[GELU-MLP FFN]  Total parameters: {n_params_gelu:,}")
-    print(f"[SwiGLU FFN]    Total parameters: {n_params_swiglu:,}")
-    print(f"Difference: {n_params_swiglu - n_params_gelu:+,} "
-          f"({'larger' if n_params_swiglu > n_params_gelu else 'smaller'} "
-          f"with default 2/3 hidden_dim scaling)")
-
-    # gradient sanity check for SwiGLU
-    loss = out_swiglu.sum()
-    loss.backward()
-    swiglu_ffn = encoder_swiglu.layers[0].ffn
-    grad_ok = (
-        swiglu_ffn.w_gate.weight.grad is not None
-        and swiglu_ffn.w_gate.weight.grad.abs().sum() > 0
-    )
-    print(f"[SwiGLU FFN] gradient reaches w_gate: {grad_ok}")

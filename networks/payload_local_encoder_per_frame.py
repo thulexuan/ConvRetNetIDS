@@ -24,7 +24,7 @@ class ResidualConvBlock1D(nn.Module):
         # (e.g. the very first block: in_channels=9 -> out_channels).
         if in_channels != out_channels:
             self.shortcut = nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, kernel_size=1),
+                nn.Conv1d(in_channels, out_channels, kernel_size=kernel_size, padding=padding),
                 nn.BatchNorm1d(out_channels),
             )
         else:

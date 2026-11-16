@@ -11,14 +11,16 @@ class ResConvTransformer(nn.Module):
     def __init__(
         self,
         num_features: int = 9,
-        d_model: int = 128,
-        out_channels_payload: int = 128,
+        d_model: int = 64,
+        out_channels_payload: int = 64,
         window_size: int = 32,
         num_layers: int = 2,
         num_heads: int = 4,
-        ffn_dim: int = 256,
+        ffn_dim: int = 64 * 2,
         num_classes: int = 10,
-        dropout: float = 0.0,
+        dropout: float = 0.1,
+        kernel_size: int = 1,
+        n_res_blocks: int = 2,
     ):
         super().__init__()
        
@@ -26,11 +28,15 @@ class ResConvTransformer(nn.Module):
         self.d_model = d_model
         self.window_size = window_size  # số frame trong mỗi window (T=window_size) - cố định, không thay đổi
 
-        self.payload_local_encoder = PayloadLocalEncoderPerFrame(
-            in_channels=9,  # can_id + 8 byte payload 
-            out_channels=out_channels_payload,
-            dropout=dropout
-        )
+        # self.payload_local_encoder = PayloadLocalEncoderPerFrame(
+        #     in_channels=9,  # can_id + 8 byte payload 
+        #     out_channels=out_channels_payload,
+        #     dropout=dropout,
+        #     kernel_size=kernel_size,
+        #     n_res_blocks=n_res_blocks,
+        # )
+
+        self.linear = nn.Linear(num_features, d_model)
 
         self.layers = nn.ModuleList(
             [
@@ -58,7 +64,8 @@ class ResConvTransformer(nn.Module):
 
         id_payload_features = x[:, :, 0:9]  # cột can_id + data0..7 
 
-        final_encode_feat = self.payload_local_encoder(id_payload_features) # (B, T, d_model)
+        # final_encode_feat = self.payload_local_encoder(id_payload_features) # (B, T, d_model)
+        final_encode_feat = self.linear(id_payload_features)  # (B, T, d_model)
 
         all_attn_weights = []
         for layer in self.layers:

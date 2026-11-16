@@ -272,15 +272,15 @@ def run_pipeline(root_dir, output_dir, window_size=29, stride_size=15, feature_s
         # sample 10% of attack windows and 10% of normal windows
         # data_3d, labels_cur = sample_10pct(data_3d, labels_cur, attack_id + 1, seed=42)
 
-        print("after sampling 10%, data_3d.len:", len(data_3d), "labels_cur.len:", len(labels_cur))
+        # print("after sampling 10%, data_3d.len:", len(data_3d), "labels_cur.len:", len(labels_cur))
 
         attack_idx = np.where(labels_cur != 0)[0] # idx of attack windows
         benign_idx = np.where(labels_cur == 0)[0] # idx of benign windows
 
         # chia train/test của attack windows
-        data_train_a, data_test_a, labels_train_a, labels_test_a = train_test_split(data_3d[attack_idx], labels_cur[attack_idx], test_size=0.8, random_state=42, shuffle=True)
+        data_train_a, data_test_a, labels_train_a, labels_test_a = train_test_split(data_3d[attack_idx], labels_cur[attack_idx], test_size=0.9, random_state=42, shuffle=True)
         # chia train/test của benign windows
-        data_train_b, data_test_b, labels_train_b, labels_test_b = train_test_split(data_3d[benign_idx], labels_cur[benign_idx], test_size=0.8, random_state=42, shuffle=True)
+        data_train_b, data_test_b, labels_train_b, labels_test_b = train_test_split(data_3d[benign_idx], labels_cur[benign_idx], test_size=0.9, random_state=42, shuffle=True)
 
         # # valdiation set
         # data_train_a, data_val_a, labels_train_a, labels_val_a = train_test_split(data_train_a, labels_train_a, test_size=0.1, random_state=42, shuffle=True)
@@ -303,6 +303,21 @@ def run_pipeline(root_dir, output_dir, window_size=29, stride_size=15, feature_s
 
         print("Adding data of attack {} to train/test sets: Done".format(attack))
 
+    # total normal and attack windows over all attack files
+    n_train_normal = int((ytrain == 0).sum())
+    n_train_attack = int((ytrain != 0).sum())
+    n_test_normal  = int((ytest == 0).sum())
+    n_test_attack  = int((ytest != 0).sum())
+
+    print("\nTotal windows")
+    print(f"  {'':8s} {'train':>8s} {'test':>8s} {'total':>8s}")
+    print(f"  {'normal':8s} {n_train_normal:8,d} {n_test_normal:8,d} "
+          f"{n_train_normal + n_test_normal:8,d}")
+    print(f"  {'attack':8s} {n_train_attack:8,d} {n_test_attack:8,d} "
+          f"{n_train_attack + n_test_attack:8,d}")
+    print(f"  {'total':8s} {len(ytrain):8,d} {len(ytest):8,d} "
+          f"{len(ytrain) + len(ytest):8,d}")
+    
     np.save(os.path.join(output_dir, f"xtrain-{window_size}-{stride_size}.npy"), xtrain)
     np.save(os.path.join(output_dir, f"ytrain-{window_size}-{stride_size}.npy"), ytrain) 
     
@@ -318,8 +333,8 @@ def run_pipeline(root_dir, output_dir, window_size=29, stride_size=15, feature_s
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root_folder", default="./data/survival_dataset/Sonata-preprocessed/first_preprocessing", help="Root folder with attack subfolders")
-    parser.add_argument("--data_folder", default="./data/survival_dataset/Sonata-preprocessed/preprocessed/", help="Root folder with attack subfolders")
+    parser.add_argument("--root_folder", default="./data/survival_dataset/Spark-preprocessed/first_preprocessing", help="Root folder with attack subfolders")
+    parser.add_argument("--data_folder", default="./data/survival_dataset/Spark-preprocessed/preprocessed/", help="Root folder with attack subfolders")
     parser.add_argument("--window_size", type=int, default=32, help="window size")
     parser.add_argument("--stride_size", type=int, default=32, help="window stride")
     parser.add_argument("--rid", type=int, default=1, help="the number of rerun preprocessing")
@@ -333,7 +348,7 @@ if __name__ == '__main__':
     if args.stride_size is None:
         args.stride_size = args.window_size
         
-    outdir =  args.data_folder + 'rid{}'.format(args.rid) + '/TFRecord_w{}_s{}'.format(args.window_size, args.stride_size)
+    outdir =  args.data_folder + 'rid{}'.format(args.rid) + '/w{}_s{}'.format(args.window_size, args.stride_size)
     run_pipeline( 
         root_dir    = args.root_folder,
         output_dir  = outdir,

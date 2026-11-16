@@ -99,7 +99,7 @@ def parse_option():
     parser.add_argument('--early_stop_patience', type=int, default=20,
                         help='patience for early stopping')
     # model parameters 
-    parser.add_argument('--embedding_dim', type=int, default=128,
+    parser.add_argument('--embedding_dim', type=int, default=64,
                         help='dimension of the embedding layer')
     parser.add_argument('--projection_dim', type=int, default=64,
                         help='dimension of the projection layer to train feature space')
@@ -117,6 +117,10 @@ def parse_option():
                     help='the number of RetNet blocks')
     parser.add_argument('--n_heads', default=4, type=int,
                     help='the number of RetNet retention layers in each block')
+    parser.add_argument('--kernel_size', default=1, type=int,
+                        help='kernel size of 1D convolutional layer in local module')
+    parser.add_argument('--n_conv_blocks', default=2, type=int,
+                        help='the number of residual convolutional blocks in local module')
     
     opt = parser.parse_args()
 
@@ -193,7 +197,7 @@ def set_model(opt):
 
     # conventional Transformer
     # model = TransformerBaselineModel(
-    #         num_features=opt.n_input_channels, d_model=opt.embedding_dim, num_heads=4, ff_dim=256,
+    #         num_features=opt.n_input_channels, d_model=opt.embedding_dim, num_heads=4, ff_dim=opt.embedding_dim * 2,
     #         num_layers=2, num_classes=opt.n_classes, dropout=0.1,
     # )
 
@@ -205,9 +209,11 @@ def set_model(opt):
             window_size=opt.window_size, 
             num_layers=opt.n_layers, 
             num_heads=opt.n_heads, 
-            ffn_dim=256, 
+            ffn_dim=opt.embedding_dim * 2, 
             num_classes=opt.n_classes, 
             dropout=0.1,
+            kernel_size=opt.kernel_size,
+            n_res_blocks=opt.n_conv_blocks
     )
     
     criterion_model = torch.nn.CrossEntropyLoss()
@@ -381,7 +387,7 @@ def main():
     opt = parse_option()
     print(opt)
 
-    seed = 1
+    seed = 2
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)

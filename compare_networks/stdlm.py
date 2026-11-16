@@ -46,13 +46,13 @@ class STDLMConfig:
     num_classes: int = 10           # 2 for binary (normal/attack), N for multi-class
 
     # MC-1DCNN (spatial) params
-    spatial_hidden: int = 16       # feature maps produced per branch
+    spatial_hidden: int = 7       # feature maps produced per branch
     id_kernel: int = 3             # kernel size for the CAN ID channel   (Eq. 3)
     payload_kernel: int = 5        # kernel size for the 8 payload channels (Eq. 3)
     spatial_dropout: float = 0.2
 
     # MC-GTCN (temporal) params
-    temporal_hidden: int = 16      # feature maps per branch inside MC-GTCN
+    temporal_hidden: int = 7      # feature maps per branch inside MC-GTCN
     tcn_kernel: int = 3            # K in Eq. 6-8
     tcn_levels: int = 4            # number of stacked dilated residual blocks
     temporal_dropout: float = 0.2
