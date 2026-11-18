@@ -195,7 +195,8 @@ def set_model(opt):
                 num_classes=opt.n_classes,
                 dropout=0.1,
                 kernel_size=opt.kernel_size,
-                n_res_blocks=opt.n_res_blocks
+                n_res_blocks=opt.n_res_blocks,
+                temporal_type="proposed",  # or "original_retnet" or "proposed"
             )
 
     criterion_model = torch.nn.CrossEntropyLoss()

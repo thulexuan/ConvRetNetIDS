@@ -6,6 +6,7 @@ from compare_networks.transformer_baseline import TransformerEncoderBlock
 from networks.bidirectional_retention_with_swiGLU import BidirectionalRetentionEncoder
 from networks.local_module import PayloadFeatureConvEncoder
 from networks.payload_local_encoder_per_frame import PayloadLocalEncoderPerFrame
+from networks.temporal_original_retnet import OriginalRetNetEncoder
 # from networks.softmax_retention_encoder import BidirectionalRetentionEncoder
 
 class ConvRetNet(nn.Module):
@@ -23,6 +24,7 @@ class ConvRetNet(nn.Module):
         dropout: float = 0.0,
         kernel_size: int = 1,
         n_res_blocks: int = 2,
+        temporal_type: str = "proposed",
     ):
         super().__init__()
        
@@ -30,15 +32,15 @@ class ConvRetNet(nn.Module):
         self.d_model = d_model
         self.window_size = window_size  # số frame trong mỗi window (T=window_size) - cố định, không thay đổi
 
-        self.linear = nn.Linear(num_features, d_model) # ablation study of without payload local encoder
+        # self.linear = nn.Linear(num_features, d_model) # ablation study of without payload local encoder
 
-        # self.payload_local_encoder = PayloadLocalEncoderPerFrame(
-        #     in_channels=9,  # can_id + 8 byte payload 
-        #     out_channels=out_channels_payload,
-        #     dropout=dropout,
-        #     kernel_size=kernel_size,
-        #     n_res_blocks=n_res_blocks
-        # )
+        self.payload_local_encoder = PayloadLocalEncoderPerFrame(
+            in_channels=9,  # can_id + 8 byte payload 
+            out_channels=out_channels_payload,
+            dropout=dropout,
+            kernel_size=kernel_size,
+            n_res_blocks=n_res_blocks
+        )
 
         # self.payload_local_encoder = PayloadFeatureConvEncoder(
         #     in_channels=9,  # can_id + 8 byte payload 
@@ -46,15 +48,35 @@ class ConvRetNet(nn.Module):
         #     dropout=dropout
         # )
 
-        self.temporal_encoder = BidirectionalRetentionEncoder(
-            dim=d_model,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            dropout=dropout,
-            # causal=True,
-            # ffn_type="swiglu"
-            ffn_type="gelu"
-        ) # có swiGLU
+        # self.temporal_encoder = BidirectionalRetentionEncoder(
+        #     dim=d_model,
+        #     num_heads=num_heads,
+        #     num_layers=num_layers,
+        #     dropout=dropout,
+        #     # causal=True,
+        #     # ffn_type="swiglu"
+        #     ffn_type="gelu"
+        # ) # có swiGLU
+
+        if temporal_type == "proposed":
+            self.temporal_encoder = BidirectionalRetentionEncoder(
+                dim=d_model,
+                num_heads=num_heads,
+                num_layers=num_layers,
+                dropout=dropout,
+                # causal=causal,
+                ffn_type="swiglu",
+            )
+        elif temporal_type == "original_retnet":
+            # original RetNet: causal decay, no softmax, GELU FFN (hidden 2d)
+            self.temporal_encoder = OriginalRetNetEncoder(
+                dim=d_model,
+                num_heads=num_heads,
+                num_layers=num_layers,
+                dropout=dropout,
+            )
+        else:
+            raise ValueError(f"unknown temporal_type: {temporal_type}")
         
         self.final_ln = nn.LayerNorm(d_model)
 
@@ -75,11 +97,11 @@ class ConvRetNet(nn.Module):
 
         id_payload_features = x[:, :, 0:9]  # cột can_id + data0..7 
 
-        # final_encode_feat = self.payload_local_encoder(id_payload_features) # (B, T, d_model)
+        final_encode_feat = self.payload_local_encoder(id_payload_features) # (B, T, d_model)
 
 
         # simple Linear first, ablation study of without payload local encoder
-        final_encode_feat = self.linear(id_payload_features)  # (B, T, d_model)
+        # final_encode_feat = self.linear(id_payload_features)  # (B, T, d_model)
 
         final_encode_feat = self.temporal_encoder(final_encode_feat)  # (B, T, d_model)
 
